@@ -6,14 +6,14 @@ sdk = StandardBotsRobot(url='http://192.168.1.3:3000', token='3citgsf7-gycosg-uy
 def out(response):
     try:
         data = response.ok()
-        print(data, "\n")
+        print(data)
     except Exception:
-        print(response.data.message, "\n")  
+        print(response.data.message)  
 
 with sdk.connection():
     
-    # unbrake robot
-    sdk.movement.brakes.unbrake().ok()
+    # brake robot
+    sdk.movement.brakes.brake().ok()
     
     # set to api control mode
     with sdk.connection():
@@ -24,63 +24,11 @@ with sdk.connection():
     response = sdk.movement.position.get_arm_position()
     out(response)
 
-    print("moving arm now!!!\n")
+    print("moving arm now!!!\n") # should not work
 
     sleep(1)
 
-    target_position = (90*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -271*3.14/180, 225*3.14/180)
-    body = models.ArmPositionUpdateRequest(
-        kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(joints=target_position),
-    )
-
-    response = sdk.movement.position.set_arm_position(body=body)
-    out(response)
-
-    print("moving arm again!  >:0\n")
-
-    sleep(1)
-
-    target_position = (90*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -271*3.14/180, 135*3.14/180)
-    body = models.ArmPositionUpdateRequest(
-        kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(joints=target_position),
-    )
-
-    response = sdk.movement.position.set_arm_position(body=body)
-    out(response)
-
-    print("still moving arm... \n")
-
-    sleep(1)
-
-    target_position = (90*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -271*3.14/180, 180*3.14/180)
-    body = models.ArmPositionUpdateRequest(
-        kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(joints=target_position),
-    )
-
-    response = sdk.movement.position.set_arm_position(body=body)
-    out(response)
-
-    print("moving arm up up up!!! \n")
-
-    sleep(1)
-
-    target_position = (90*3.14/180, 16*3.14/180, 80*3.14/180, 22*3.14/180, -271*3.14/180, 180*3.14/180)
-    body = models.ArmPositionUpdateRequest(
-        kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(joints=target_position),
-    )
-
-    response = sdk.movement.position.set_arm_position(body=body)
-    out(response)
-
-    print("moving arm back :D \n")
-
-    sleep(1)
-
-    target_position = (90*3.14/180, 16*3.14/180, 150*3.14/180, 22*3.14/180, -271*3.14/180, 180*3.14/180)
+    target_position = (90*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -271*3.14/180, 145*3.14/180)
     body = models.ArmPositionUpdateRequest(
         kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
         joint_rotation=models.ArmJointRotations(joints=target_position),
