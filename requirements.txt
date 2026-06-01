@@ -1,1 +1,3 @@
 standardbots
+opencv-python
+numpy
