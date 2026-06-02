@@ -1,17 +1,9 @@
+import sys
 import time
+import termios
+import tty
+import select
 import threading
-from collections import deque
-
-import matplotlib as mpl
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from matplotlib import gridspec
-
-# Suppress all default matplotlib key bindings (s=save, q=quit, etc.)
-# so they don't conflict with our joint controls.
-for key in list(mpl.rcParams):
-    if key.startswith("keymap."):
-        mpl.rcParams[key] = []
 
 from ah_wrapper import AHSerialClient
 
@@ -40,6 +32,11 @@ KEY_MAP = {
     'j': (4, +1), 'u': (4, -1),   # thumb flexor
     'k': (5, -1), 'i': (5, +1),   # thumb rotator
 }
+
+# Terminals don't emit key-release events. While a key is held the terminal
+# auto-repeats it, so we treat a key as "pressed" until no repeat has arrived
+# within KEY_TIMEOUT seconds, at which point it is considered released.
+KEY_TIMEOUT = 0.15
 
 RUNNING = True
 
@@ -83,6 +80,83 @@ def control_thread(controller):
         time.sleep(dt)
 
 
+def keyboard_thread(controller):
+    """Reads single keypresses from the terminal in raw mode and maintains
+    the controller's set of currently-held keys. Relies on terminal key
+    auto-repeat to keep a key 'held'; a key with no repeat within
+    KEY_TIMEOUT is released. Space opens the hand, Esc/Ctrl-C quits."""
+    global RUNNING
+    last_seen = {}
+    while RUNNING:
+        # Wait for input with a short timeout so we can expire stale keys.
+        ready, _, _ = select.select([sys.stdin], [], [], 0.02)
+        now = time.time()
+        if ready:
+            ch = sys.stdin.read(1)
+            if ch in ('\x1b', '\x03'):  # Esc or Ctrl-C
+                RUNNING = False
+                break
+            elif ch == ' ':
+                controller.open_hand()
+            elif ch in KEY_MAP:
+                last_seen[ch] = now
+                controller.keys_pressed.add(ch)
+
+        # Expire keys that haven't repeated recently (key released).
+        for key in list(controller.keys_pressed):
+            if now - last_seen.get(key, 0) > KEY_TIMEOUT:
+                controller.keys_pressed.discard(key)
+
+
+def print_help():
+    print("PSYONIC Manual Control (CLI)")
+    print("-" * 60)
+    print("  [Q/A] Pinky    [W/S] Ring     [E/D] Middle")
+    print("  [R/F] Index    [U/J] Thb Flex [I/K] Thb Rot")
+    print("  Top row opens, bottom row closes.")
+    print("  [Space] Open hand   [Esc / Ctrl-C] Quit")
+    print("-" * 60)
+    print("Hold a key to move the joint; release to stop.")
+    print()
+
+
+def status_loop(controller):
+    """Continuously prints joint targets and live feedback to the terminal
+    on a single refreshing line (no graphs, no pop-ups)."""
+    client = controller.client
+    while RUNNING:
+        hand = client.hand
+        pos = hand.get_position()
+        fsr = hand.get_fsr()
+
+        t = controller.positions
+        targets = (
+            f"Idx={t[0]:5.1f} Mid={t[1]:5.1f} Rng={t[2]:5.1f} "
+            f"Pnk={t[3]:5.1f} ThF={t[4]:5.1f} ThR={t[5]:6.1f}"
+        )
+
+        if pos:
+            # Negate thumb rotator for display (matches plotting version).
+            disp = [(-pos[j] if j == 5 else pos[j]) for j in range(NUM_JOINTS)]
+            actual = " ".join(f"{p:5.1f}" for p in disp)
+        else:
+            actual = "n/a"
+
+        if fsr:
+            forces = " ".join(
+                f"{FINGER_NAMES[i][:3]}={sum(fsr[i * 6:i * 6 + 6]):4.1f}"
+                for i in range(NUM_FINGERS)
+            )
+        else:
+            forces = "n/a"
+
+        line = f"Target: {targets} | Pos: {actual} | Force(N): {forces}"
+        # \r refreshes the same line; pad to clear leftover characters.
+        sys.stdout.write("\r" + line[:200].ljust(200))
+        sys.stdout.flush()
+        time.sleep(0.1)
+
+
 def main():
     global RUNNING
 
@@ -93,171 +167,28 @@ def main():
     ctrl_thread.start()
     time.sleep(0.5)
 
-    # --- Data buffers ---
-    window_size = 10
-    max_samples = window_size * 50
-    x_data = deque(maxlen=max_samples)
-    pos_data = [deque(maxlen=max_samples) for _ in range(NUM_JOINTS)]
-    vel_data = [deque(maxlen=max_samples) for _ in range(NUM_JOINTS)]
-    cur_data = [deque(maxlen=max_samples) for _ in range(NUM_JOINTS)]
-    fsr_data = [deque(maxlen=max_samples) for _ in range(NUM_FINGERS)]
-    start_time = time.time()
+    print_help()
 
-    # --- Figure layout ---
-    fig = plt.figure(figsize=(14, 9))
-    fig.canvas.manager.set_window_title("PSYONIC Manual Control")
-
-    gs_main = gridspec.GridSpec(
-        3, 2, figure=fig, width_ratios=[1.2, 1], wspace=0.35, hspace=0.45,
-    )
-
-    # Left column: 3 motor plots (position, velocity, current)
-    motor_axes = [fig.add_subplot(gs_main[i, 0]) for i in range(3)]
-    for ax in motor_axes[:-1]:
-        ax.tick_params(labelbottom=False)
-
-    # Right column: 5 touch sensor plots nested inside the full right column
-    gs_touch = gridspec.GridSpecFromSubplotSpec(
-        5, 1, subplot_spec=gs_main[:, 1], hspace=0.5,
-    )
-    touch_axes = [fig.add_subplot(gs_touch[i]) for i in range(5)]
-    for ax in touch_axes[:-1]:
-        ax.tick_params(labelbottom=False)
-
-    # --- Motor plot setup ---
-    motor_titles = ["Position", "Velocity", "Current"]
-    motor_ylabels = ["\u00b0", "\u00b0/s", "A"]
-    motor_yranges = [(0, 110), (-500, 500), (-1, 1)]
-    motor_lines = []  # motor_lines[plot_idx][joint_idx]
-
-    for plot_idx, ax in enumerate(motor_axes):
-        jlines = []
-        for j in range(NUM_JOINTS):
-            (ln,) = ax.plot([], [], linewidth=1)
-            jlines.append(ln)
-        motor_lines.append(jlines)
-        ax.set_ylim(*motor_yranges[plot_idx])
-        ax.set_ylabel(motor_ylabels[plot_idx], fontsize=9)
-        ax.set_title(
-            motor_titles[plot_idx], fontsize=10, loc="left", fontweight="bold",
-        )
-        ax.grid(True, alpha=0.3)
-    motor_axes[-1].set_xlabel("Time (s)")
-    fig.legend(
-        motor_lines[0], JOINT_NAMES, loc="upper left",
-        fontsize=7, ncol=6, bbox_to_anchor=(0.02, 0.99),
-    )
-
-    # --- Touch plot setup ---
-    touch_lines = []
-    for i, ax in enumerate(touch_axes):
-        (ln,) = ax.plot([], [], linewidth=1.5, color="#1f77b4")
-        touch_lines.append(ln)
-        ax.set_ylim(0, 8)
-        ax.set_ylabel("N", fontsize=9)
-        ax.grid(True, alpha=0.3)
-        ax.set_title(
-            FINGER_NAMES[i], fontsize=9, loc="left", fontweight="bold",
-        )
-    touch_axes[0].text(
-        0.5, 1.35, "Touch Sensors", transform=touch_axes[0].transAxes,
-        ha="center", fontsize=10, fontweight="bold",
-    )
-    touch_axes[-1].set_xlabel("Time (s)")
-
-    # --- Annotations ---
-    fig.text(
-        0.5, 0.005,
-        "[Q/A] Pinky  [W/S] Ring  [E/D] Middle  [R/F] Index  "
-        "[U/J] Thb Flex  [I/K] Thb Rot  [Space] Open  [Esc] Quit",
-        ha="center", fontsize=8, family="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.9),
-    )
-    # Axes-level text so it can be returned as a blit artist
-    pos_text = motor_axes[0].text(
-        0.5, 1.15, "", transform=motor_axes[0].transAxes,
-        fontsize=8, ha="center", family="monospace",
-        bbox=dict(boxstyle="round", facecolor="lightcyan", alpha=0.9),
-    )
-
-    plt.subplots_adjust(bottom=0.06, top=0.94, left=0.06, right=0.98)
-
-    # --- Keyboard ---
-    def on_key_press(event):
-        global RUNNING
-        if event.key == ' ':
-            controller.open_hand()
-        elif event.key == 'escape':
-            RUNNING = False
-            plt.close(fig)
-        else:
-            controller.keys_pressed.add(event.key)
-
-    def on_key_release(event):
-        controller.keys_pressed.discard(event.key)
-
-    fig.canvas.mpl_connect("key_press_event", on_key_press)
-    fig.canvas.mpl_connect("key_release_event", on_key_release)
-
-    # Collect all animated artists for blit
-    all_artists = []
-    for jlines in motor_lines:
-        all_artists.extend(jlines)
-    all_artists.extend(touch_lines)
-    all_artists.append(pos_text)
-
-    # --- Animation ---
-    def update_plot(frame):
-        current_time = time.time() - start_time
-        x_data.append(current_time)
-
-        hand = client.hand
-        pos = hand.get_position()
-        vel = hand.get_velocity()
-        cur = hand.get_current()
-        fsr = hand.get_fsr()
-
-        for j in range(NUM_JOINTS):
-            p = pos[j] if pos else 0.0
-            # Negate thumb rotator for display (matches RealTimePlotMotors)
-            pos_data[j].append(-p if j == 5 else p)
-            vel_data[j].append(vel[j] if vel else 0.0)
-            cur_data[j].append(cur[j] if cur else 0.0)
-
-        for i in range(NUM_FINGERS):
-            fsr_data[i].append(sum(fsr[i * 6 : i * 6 + 6]) if fsr else 0.0)
-
-        sources = [pos_data, vel_data, cur_data]
-        for plot_idx in range(3):
-            for j in range(NUM_JOINTS):
-                motor_lines[plot_idx][j].set_data(x_data, sources[plot_idx][j])
-
-        for i in range(NUM_FINGERS):
-            touch_lines[i].set_data(x_data, fsr_data[i])
-
-        min_x = max(0, current_time - window_size)
-        for ax in motor_axes + touch_axes:
-            ax.set_xlim(min_x, min_x + window_size)
-
-        t = controller.positions
-        pos_text.set_text(
-            f"Targets:  Idx={t[0]:5.1f}\u00b0  Mid={t[1]:5.1f}\u00b0  "
-            f"Rng={t[2]:5.1f}\u00b0  Pnk={t[3]:5.1f}\u00b0  "
-            f"ThF={t[4]:5.1f}\u00b0  ThR={t[5]:6.1f}\u00b0"
-        )
-
-        return all_artists
-
-    ani = FuncAnimation(
-        fig, update_plot, interval=10, blit=True, cache_frame_data=False,
-    )
-
+    # Put the terminal into cbreak mode so keypresses are delivered
+    # immediately, one character at a time, without echoing them.
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
     try:
-        plt.show()
+        tty.setcbreak(fd)
+
+        kb_thread = threading.Thread(
+            target=keyboard_thread, args=(controller,), daemon=True
+        )
+        kb_thread.start()
+
+        # Run the status display in the main thread until quit.
+        status_loop(controller)
     except KeyboardInterrupt:
         pass
     finally:
         RUNNING = False
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        print()  # move off the status line
         client.close()
 
 
