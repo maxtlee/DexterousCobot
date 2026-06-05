@@ -1,7 +1,8 @@
+from pathlib import Path
 from standardbots import StandardBotsRobot, models
 from time import sleep
 
-sdk = StandardBotsRobot(url='http://192.168.1.3:3000', token='3citgsf7-gycosg-uy730cec-4pr51c', robot_kind=StandardBotsRobot.RobotKind.Live,)
+sdk = StandardBotsRobot(url='http://192.168.1.3:3000', token=Path("/home/max/Documents/.robot_token").read_text().strip(), robot_kind=StandardBotsRobot.RobotKind.Live,)
 
 def out(response):
     try:
