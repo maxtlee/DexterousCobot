@@ -136,50 +136,112 @@ question once the config parses.
 
 ---
 
+## 9. ROS2 Bridge bring-up — finishing the saga
+
+After §8 fixed the cyclonedds.xml parse error, `ros2 topic list` still showed only
+`/parameter_events` and `/rosout` despite the robot's `domain_bridge` participant being
+discovered cleanly via SPDP. Two more bugs were stacked on top of the config one.
+
+### Bug A — ROS bridge was disabled at the robot
+`sdk.ros.status.get_ros_control_state()` returned `Disabled`. The `domain_bridge` process
+runs and is discoverable via SPDP **even when ROS control is off** — it just publishes the
+ROS2 builtins (`ros_discovery_info`, `rt/rosout`, `rt/parameter_events`) and forwards
+nothing else from the robot's internal ROS domain.
+
+**Enable dance: brake state matters.** A bare `update_ros_control_state(Enabled)` returned
+`500 cannot_change_ros_state` when the arm was braked. Order:
+
+```python
+sdk.movement.brakes.unbrake().ok()
+sdk.ros.control.update_ros_control_state(
+    models.ROSControlUpdateRequest(action=models.ROSControlStateEnum.Enabled)
+).ok()
+```
+
+`write_poses.py` already does it in this order; ad-hoc scripts don't.
+
+### Bug B — robot advertises a locator we have no route to
+Once the bridge was enabled, the hardware topics still didn't appear in `ros2 topic list`.
+**The §8 next-step #4 hypothesis was nearly right but slightly off:** CycloneDDS does NOT
+discard the participant when the advertised locator is on a foreign subnet — it picks the
+**first**-listed locator and silently sends everything there.
+
+The robot announces both of its eth0 IPs in SPDP:
+```
+metatraffic_unicast_locator={udp/192.168.0.134:7660, udp/192.168.1.3:7660}
+default_unicast_locator  ={udp/192.168.0.134:7661, udp/192.168.1.3:7661}
+```
+
+`192.168.0.134` is on the robot's internal/service VLAN; `192.168.1.3` is the IP we ping.
+**Both live on the same physical NIC on the robot** — same MAC, check with `arp -n`:
+```
+192.168.1.3    ether   00:e0:4c:68:05:76   C   eth0
+192.168.0.134  ether   00:e0:4c:68:05:76   C   eth0
+```
+
+`finest` trace, after the bridge was enabled:
+```
+ddsi_rebuild_writer_addrset(110c529:...:3c2): udp/192.168.0.134:7660@2
+... (×10 endpoints, all 192.168.0.134, never 192.168.1.3)
+nn_xpack_send to udp/192.168.0.134:7660@2 ... ×276 packets, vs ×5 to 192.168.1.3
+```
+
+With no route for `192.168.0.0/24`, the kernel sent those packets via the wlan0 default
+gateway and they were black-holed. **Fix:** add a link-scope route via eth0 so the kernel
+ARPs on the wire that actually carries the robot.
+
+```bash
+sudo ip route add 192.168.0.0/24 dev eth0           # one-shot
+```
+
+Persist via NetworkManager (the eth0 connection on this host is `netplan-eth0`):
+```bash
+nmcli connection modify netplan-eth0 +ipv4.routes "192.168.0.0/24"
+nmcli connection up netplan-eth0
+```
+
+Verify: `ip route get 192.168.0.134` reports `dev eth0`, and `ping 192.168.0.134` works
+without `-I eth0`.
+
+### Two CycloneDDS code paths pick different locators — read the right log
+- `setcover` (seen in SPDP routing) optimizes which addresses to send discovery beacons
+  to. It picked `192.168.1.3` here, which is what made it look like the right address
+  was already being used. **It's not what matters for data.**
+- `ddsi_rebuild_writer_addrset` picks the address used for per-writer DATA / HEARTBEAT /
+  ACKNACK. In this version it iterates the participant's locator list and takes the first.
+  Always cross-check this when asking "where is my data actually going."
+
+### End-to-end confirmation
+```
+$ ./run.sh python3 ./src/read_joint_states.py
+Reading joint states from robot:  bot_0sapi_a0qbmeRWQdoY3PMVAq48
+Spinning...
+[1.363..., -0.209..., 1.788..., 2.273..., -4.961..., 3.142...]
+```
+
+---
+
 ## Next steps
 
-1. **Fix `/etc/standardbots/configuration/cyclonedds.xml` line 18.** Replace the invalid
-   `<Participants>` element. Target Discovery block:
-   ```xml
-   <Discovery>
-     <ParticipantIndex>auto</ParticipantIndex>
-     <Peers>
-       <Peer address="192.168.1.3"/>
-     </Peers>
-   </Discovery>
-   ```
-   (Or just drop the bad element and keep `<ParticipantIndex>auto</ParticipantIndex>`.)
-2. **Confirm the file parses cleanly** — CycloneDDS reports only the *first* bad element, so
-   re-run until there are no `config:` lines:
-   ```bash
-   ros2 topic list 2>&1 | grep -i "config:"
-   ```
-   Keep tracing at `<Verbosity>config</Verbosity>` so the file still parses.
-3. **Re-run `ros2 topic list`.** If the bot's topics appear → done; move on to streaming
-   joint trajectories.
-4. **If back to "packets arrive but 0 participants":** re-enable `finest` tracing and inspect
-   the SPDP announcement's advertised **unicast locators**. If they're an internal/NAT address
-   (`172.x`, `127.0.0.1`, foreign subnet) rather than `192.168.1.3`, CycloneDDS discards the
-   participant as unreachable — that's a robot-side bridge config issue to raise with Standard
-   Bots support (provide the captured locator). Grep the trace:
-   ```bash
-   grep -iE "SPDP|locator|new.*participant|ignor" <trace>
-   ```
-5. **Daemon hygiene** when results look stale:
+1. **Daemon hygiene** when results look stale:
    ```bash
    ros2 daemon stop && ROS_DOMAIN_ID=1 ros2 topic list --no-daemon
    ```
-6. Once topics are live, build the **Jacobian → joint-trajectory** velocity-control node
-   (see §6).
+2. Build the **Jacobian → joint-trajectory** velocity-control node (see §6).
 
 ## Standing reminders / credentials
-- Robot IP/token hardcoded across scripts. Token from RO1 web UI → API settings. A 401
-  "Invalid token" means it was regenerated → update every script. (Current token in tree:
-  `3citgsf7-gycosg-uy730cec-4pr51c`.)
+- Token lives in `/home/max/Documents/.robot_token` (mode 600, gitignored). All scripts
+  read it via `Path("/home/max/Documents/.robot_token").read_text().strip()`. On a 401
+  "Invalid token", regenerate from RO1 web UI → API settings and overwrite that one file
+  — no script edits needed. (Last working token stored there as of 2026-06-05.)
 - Always run scripts with the venv interpreter: `.venv/bin/python <script>.py`.
 - No trailing slash on the robot URL (see §1).
+- The `192.168.0.0/24` route via eth0 (see §9) is required for ROS2 topics to flow. If
+  topics suddenly stop after a reboot, `ip route` and re-add per §9. Make it persistent
+  via the `nmcli connection modify netplan-eth0 +ipv4.routes …` form in §9.
 
 ## References
 - RO1 Software Overview: https://help.standardbots.com/5-software-overview.html
 - ROS2 Realtime API repo: https://github.com/standardbots/ros2-realtime-api
 - RO1 User Manual: https://help.standardbots.com/
+
