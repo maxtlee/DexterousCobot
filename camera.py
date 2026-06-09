@@ -10,6 +10,14 @@ sdk = StandardBotsRobot(
 )
 
 
+def out(response):
+    try:
+        data = response.ok()
+        print(data, "\n")
+    except Exception:
+        print(response.data.message, "\n")  
+
+
 body = models.CameraFrameRequest(
     camera_settings=models.CameraSettings(
         brightness=0,
@@ -23,6 +31,8 @@ body = models.CameraFrameRequest(
 )
 
 with sdk.connection():
+    cameras = sdk.camera.bot.get_connected_cameras()
+    out(cameras)
     res = sdk.camera.data.get_color_frame(body)
 
 raw_data = res.response.data
