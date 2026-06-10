@@ -2,15 +2,13 @@
 """Interactive GUI tuner for the 6 ``ballColor`` values in combinedtest.py.
 
 Opens an OpenCV window showing the live camera stream and the filtered (masked)
-stream side by side, with the 6 parameters exposed as trackbars: centre R/G/B
-and tolerance R/G/B. Drag the sliders and watch the mask update live.
+stream side by side, with the 6 parameters exposed as trackbars: min R/G/B and
+max R/G/B. Drag the sliders and watch the mask update live.
 
 The mask is computed the same way combinedtest.main() does so the values you
-pick transfer straight back into ``ballColor``::
+pick transfer straight back into ``ballColor`` (stored as ``([min...], [max...])``)::
 
-    isBall = abs(channel - centre) < tol   for all 3 channels
-
-The subtraction is done in int16 so it does not wrap around for dark pixels.
+    isBall = (min <= channel <= max)   for all 3 channels
 
 Usage:
     .venv/bin/python tune_ball_color.py            # use the robot camera
@@ -31,34 +29,31 @@ import time
 import cv2
 import numpy as np
 
-# Starting values mirror ballColor in combinedtest.py
-# (tolerance = 2; tol = [33, 38, 20] * tolerance).
-START_CENTER = [153, 152, 97]
-START_TOL = [66, 76, 40]
+# Starting values mirror ballColor in combinedtest.py (per-channel min/max).
+START_MIN = [87, 76, 57]
+START_MAX = [219, 228, 137]
 
 WINDOW = "ball-color tuner"
 TRACKBARS = [
-    ("center R", 255),
-    ("center G", 255),
-    ("center B", 255),
-    ("tol R", 255),
-    ("tol G", 255),
-    ("tol B", 255),
+    ("min R", 255),
+    ("min G", 255),
+    ("min B", 255),
+    ("max R", 255),
+    ("max G", 255),
+    ("max B", 255),
 ]
 
 
 # --------------------------------------------------------------------------- #
 # Mask + image helpers
 # --------------------------------------------------------------------------- #
-def compute_mask(frame, center, tol):
+def compute_mask(frame, lo, hi):
     """Boolean mask of ball pixels for an RGB uint8 frame.
 
-    Matches combinedtest.main(): a pixel is kept when |channel - centre| < tol
-    for all three channels. The subtraction is done in int16 so it does not
-    wrap around for dark pixels.
+    Matches combinedtest.main(): a pixel is kept when lo <= channel <= hi for
+    all three channels (inclusive per-channel min/max).
     """
-    diff = np.abs(frame.astype(np.int16) - np.array(center, dtype=np.int16))
-    return (diff < np.array(tol)).all(axis=2)
+    return ((frame >= np.array(lo)) & (frame <= np.array(hi))).all(axis=2)
 
 
 def make_demo_frame(t):
@@ -79,7 +74,8 @@ def make_demo_frame(t):
     r = 55
     ball = (xx - cx) ** 2 + (yy - cy) ** 2 < r * r
     img = bg.astype(np.uint8)
-    img[ball] = np.array(START_CENTER, dtype=np.uint8)
+    mid = [(lo + hi) // 2 for lo, hi in zip(START_MIN, START_MAX)]
+    img[ball] = np.array(mid, dtype=np.uint8)
     noise = (np.random.randn(h, w, 1) * 6).astype(np.int16)
     return np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
@@ -100,9 +96,9 @@ def label(img_bgr, text):
     return img_bgr
 
 
-def build_display(frame_rgb, center, tol, fps, paused, disp_w):
+def build_display(frame_rgb, lo, hi, fps, paused, disp_w):
     """Return (composite BGR image, coverage%) for one frame."""
-    mask = compute_mask(frame_rgb, center, tol)
+    mask = compute_mask(frame_rgb, lo, hi)
     coverage = float(mask.mean()) * 100.0
     filtered_rgb = np.where(mask[..., None], frame_rgb, np.uint8(0)).astype(np.uint8)
 
@@ -113,24 +109,27 @@ def build_display(frame_rgb, center, tol, fps, paused, disp_w):
     combo = np.hstack([live, filt])
 
     bar = "ballColor = ([%d,%d,%d], [%d,%d,%d])  %.0f fps%s" % (
-        center[0], center[1], center[2], tol[0], tol[1], tol[2],
+        lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
         fps, "  [PAUSED]" if paused else "")
     foot = np.zeros((26, combo.shape[1], 3), dtype=np.uint8)
     cv2.putText(foot, bar, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (180, 255, 180), 1, cv2.LINE_AA)
-    # swatch of the current centre colour (centre is RGB -> BGR for display)
-    cv2.rectangle(foot, (combo.shape[1] - 30, 4), (combo.shape[1] - 6, 22),
-                  (int(center[2]), int(center[1]), int(center[0])), -1)
+    # swatches of the min (left) and max (right) colours (RGB -> BGR for display)
+    w = combo.shape[1]
+    cv2.rectangle(foot, (w - 58, 4), (w - 34, 22),
+                  (int(lo[2]), int(lo[1]), int(lo[0])), -1)
+    cv2.rectangle(foot, (w - 30, 4), (w - 6, 22),
+                  (int(hi[2]), int(hi[1]), int(hi[0])), -1)
     return np.vstack([combo, foot]), coverage
 
 
-def format_ball_color(center, tol):
+def format_ball_color(lo, hi):
     return "ballColor = ([%d,%d,%d], [%d,%d,%d])" % (
-        center[0], center[1], center[2], tol[0], tol[1], tol[2])
+        lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
 
 
-def save_values(center, tol):
-    line = format_ball_color(center, tol)
+def save_values(lo, hi):
+    line = format_ball_color(lo, hi)
     try:
         with open("ball_color_tuned.txt", "w") as f:
             f.write(line + "\n")
@@ -197,7 +196,7 @@ class CameraThread(threading.Thread):
 # Trackbars
 # --------------------------------------------------------------------------- #
 def create_trackbars():
-    starts = START_CENTER + START_TOL
+    starts = START_MIN + START_MAX
     for (name, vmax), val in zip(TRACKBARS, starts):
         cv2.createTrackbar(name, WINDOW, val, vmax, lambda v: None)
 
@@ -207,8 +206,8 @@ def read_trackbars():
     return pos[0:3], pos[3:6]
 
 
-def set_trackbars(center, tol):
-    for (name, _), val in zip(TRACKBARS, list(center) + list(tol)):
+def set_trackbars(lo, hi):
+    for (name, _), val in zip(TRACKBARS, list(lo) + list(hi)):
         cv2.setTrackbarPos(name, WINDOW, val)
 
 
@@ -224,12 +223,12 @@ def waiting_screen(width, message):
 # --------------------------------------------------------------------------- #
 def run_selftest(demo):
     frame = make_demo_frame(0.0)
-    combo, coverage = build_display(frame, list(START_CENTER), list(START_TOL),
+    combo, coverage = build_display(frame, list(START_MIN), list(START_MAX),
                                     15.0, False, 480)
     out = "tuner_selftest.png"
     cv2.imwrite(out, combo)
     print("wrote %s  shape=%s  coverage=%.2f%%" % (out, combo.shape, coverage))
-    print(format_ball_color(list(START_CENTER), list(START_TOL)))
+    print(format_ball_color(list(START_MIN), list(START_MAX)))
     print("selftest OK")
 
 
@@ -263,10 +262,10 @@ def main():
 
     last = time.time()
     fps = 0.0
-    center, tol = list(START_CENTER), list(START_TOL)
+    lo, hi = list(START_MIN), list(START_MAX)
     try:
         while True:
-            center, tol = read_trackbars()
+            lo, hi = read_trackbars()
 
             frame = cam.get()
             now = time.time()
@@ -279,7 +278,7 @@ def main():
                 cv2.imshow(WINDOW, waiting_screen(
                     2 * args.width, cam.error or "waiting for camera..."))
             else:
-                combo, _ = build_display(frame, center, tol, fps,
+                combo, _ = build_display(frame, lo, hi, fps,
                                          cam.paused, args.width)
                 cv2.imshow(WINDOW, combo)
 
@@ -287,11 +286,11 @@ def main():
             if key in (ord("q"), 27):  # q or Esc
                 break
             elif key == ord("s"):
-                save_values(center, tol)
+                save_values(lo, hi)
             elif key == ord("p"):
                 cam.paused = not cam.paused
             elif key == ord("r"):
-                set_trackbars(START_CENTER, START_TOL)
+                set_trackbars(START_MIN, START_MAX)
 
             # window closed via the [x] button
             if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
@@ -302,7 +301,7 @@ def main():
         cam.stop()
         cam.join(timeout=1.0)
         cv2.destroyAllWindows()
-        print(format_ball_color(center, tol))
+        print(format_ball_color(lo, hi))
 
 
 if __name__ == "__main__":

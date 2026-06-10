@@ -20,9 +20,9 @@ handOpen = [40, 40, 40, 40, 20, -60]
 handClosed = [70, 70, 70, 70, 50, -80]
 
 groundColor = ([75,70,68], [20,15,15])
-tolerance = 2
-# ballColor = ([193,192,127], [33*tolerance,38*tolerance,20*tolerance])
-ballColor = ([153,152,97], [33*tolerance,38*tolerance,20*tolerance])
+# ballColor as per-channel [min R,G,B], [max R,G,B]; a pixel is a ball pixel
+# when min <= channel <= max for all 3 channels.
+ballColor = ([87,76,57], [219,228,137])
 
 defaultCameraRequest = models.CameraFrameRequest(
             camera_settings=models.CameraSettings(
@@ -49,12 +49,12 @@ def main():
 
         # isBall = np.vectorize(lambda pix: (abs(pix[0] - ballColor[0][0]) < ballColor[1][0]) and (abs(pix[1] - ballColor[0][1]) < ballColor[1][1]) and (abs(pix[2] - ballColor[0][2]) < ballColor[1][2]))
         # isBallFrame = isBall(pix=(frame[:,:,0],frame[:,:,1],frame[:,:,2]))
-        frame0 = frame[:,:,0].astype(np.int16)
-        isBall0 = abs(frame0 - ballColor[0][0]) < ballColor[1][0]
-        frame1 = frame[:,:,1].astype(np.int16)
-        isBall1 = abs(frame1 - ballColor[0][1]) < ballColor[1][1]
-        frame2 = frame[:,:,2].astype(np.int16)
-        isBall2 = abs(frame2 - ballColor[0][2]) < ballColor[1][2]
+        frame0 = frame[:,:,0]
+        isBall0 = (frame0 >= ballColor[0][0]) & (frame0 <= ballColor[1][0])
+        frame1 = frame[:,:,1]
+        isBall1 = (frame1 >= ballColor[0][1]) & (frame1 <= ballColor[1][1])
+        frame2 = frame[:,:,2]
+        isBall2 = (frame2 >= ballColor[0][2]) & (frame2 <= ballColor[1][2])
 
         isBallFrame = isBall2 & isBall1 & isBall0
 
