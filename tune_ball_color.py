@@ -2,13 +2,15 @@
 """Interactive GUI tuner for the 6 ``ballColor`` values in combinedtest.py.
 
 Opens an OpenCV window showing the live camera stream and the filtered (masked)
-stream side by side, with the 6 parameters exposed as trackbars: min R/G/B and
-max R/G/B. Drag the sliders and watch the mask update live.
+stream side by side, with the 6 parameters exposed as trackbars: min H/S/V and
+max H/S/V. Drag the sliders and watch the mask update live.
 
-The mask is computed the same way combinedtest.main() does so the values you
-pick transfer straight back into ``ballColor`` (stored as ``([min...], [max...])``)::
+The camera frame is converted RGB -> HSV (OpenCV scale: H 0-179, S/V 0-255)
+before thresholding. The mask is computed the same way combinedtest.main() does
+so the values you pick transfer straight back into ``ballColor`` (stored as HSV
+``([min...], [max...])``)::
 
-    isBall = (min <= channel <= max)   for all 3 channels
+    isBall = (min <= channel <= max)   for all 3 HSV channels
 
 Usage:
     .venv/bin/python tune_ball_color.py            # use the robot camera
@@ -29,31 +31,36 @@ import time
 import cv2
 import numpy as np
 
-# Starting values mirror ballColor in combinedtest.py (per-channel min/max).
-START_MIN = [87, 76, 57]
-START_MAX = [219, 228, 137]
+# Starting values mirror ballColor in combinedtest.py (per-channel HSV min/max,
+# OpenCV scale: H 0-179, S/V 0-255).
+START_MIN = [20, 40, 80]
+START_MAX = [40, 200, 240]
+# Colour the synthetic --demo ball is painted with (RGB); its HSV lands inside
+# the default window above.
+DEMO_BALL_RGB = [153, 152, 97]
 
 WINDOW = "ball-color tuner"
 TRACKBARS = [
-    ("min R", 255),
-    ("min G", 255),
-    ("min B", 255),
-    ("max R", 255),
-    ("max G", 255),
-    ("max B", 255),
+    ("min H", 179),
+    ("min S", 255),
+    ("min V", 255),
+    ("max H", 179),
+    ("max S", 255),
+    ("max V", 255),
 ]
 
 
 # --------------------------------------------------------------------------- #
 # Mask + image helpers
 # --------------------------------------------------------------------------- #
-def compute_mask(frame, lo, hi):
+def compute_mask(frame_rgb, lo, hi):
     """Boolean mask of ball pixels for an RGB uint8 frame.
 
-    Matches combinedtest.main(): a pixel is kept when lo <= channel <= hi for
-    all three channels (inclusive per-channel min/max).
+    Matches combinedtest.main(): the frame is converted to HSV and a pixel is
+    kept when lo <= channel <= hi for all three HSV channels (inclusive).
     """
-    return ((frame >= np.array(lo)) & (frame <= np.array(hi))).all(axis=2)
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    return ((hsv >= np.array(lo)) & (hsv <= np.array(hi))).all(axis=2)
 
 
 def make_demo_frame(t):
@@ -74,8 +81,7 @@ def make_demo_frame(t):
     r = 55
     ball = (xx - cx) ** 2 + (yy - cy) ** 2 < r * r
     img = bg.astype(np.uint8)
-    mid = [(lo + hi) // 2 for lo, hi in zip(START_MIN, START_MAX)]
-    img[ball] = np.array(mid, dtype=np.uint8)
+    img[ball] = np.array(DEMO_BALL_RGB, dtype=np.uint8)
     noise = (np.random.randn(h, w, 1) * 6).astype(np.int16)
     return np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
 
@@ -108,23 +114,25 @@ def build_display(frame_rgb, lo, hi, fps, paused, disp_w):
                  "FILTERED  coverage %.1f%%" % coverage)
     combo = np.hstack([live, filt])
 
-    bar = "ballColor = ([%d,%d,%d], [%d,%d,%d])  %.0f fps%s" % (
+    bar = "ballColor(HSV) = ([%d,%d,%d], [%d,%d,%d])  %.0f fps%s" % (
         lo[0], lo[1], lo[2], hi[0], hi[1], hi[2],
         fps, "  [PAUSED]" if paused else "")
     foot = np.zeros((26, combo.shape[1], 3), dtype=np.uint8)
     cv2.putText(foot, bar, (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (180, 255, 180), 1, cv2.LINE_AA)
-    # swatches of the min (left) and max (right) colours (RGB -> BGR for display)
+    # swatches of the min (left) and max (right) HSV bounds, shown as BGR
     w = combo.shape[1]
+    lo_bgr = cv2.cvtColor(np.uint8([[lo]]), cv2.COLOR_HSV2BGR)[0, 0]
+    hi_bgr = cv2.cvtColor(np.uint8([[hi]]), cv2.COLOR_HSV2BGR)[0, 0]
     cv2.rectangle(foot, (w - 58, 4), (w - 34, 22),
-                  (int(lo[2]), int(lo[1]), int(lo[0])), -1)
+                  tuple(int(c) for c in lo_bgr), -1)
     cv2.rectangle(foot, (w - 30, 4), (w - 6, 22),
-                  (int(hi[2]), int(hi[1]), int(hi[0])), -1)
+                  tuple(int(c) for c in hi_bgr), -1)
     return np.vstack([combo, foot]), coverage
 
 
 def format_ball_color(lo, hi):
-    return "ballColor = ([%d,%d,%d], [%d,%d,%d])" % (
+    return "ballColor = ([%d,%d,%d], [%d,%d,%d])  # HSV min,max" % (
         lo[0], lo[1], lo[2], hi[0], hi[1], hi[2])
 
 

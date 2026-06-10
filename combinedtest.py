@@ -20,9 +20,10 @@ handOpen = [40, 40, 40, 40, 20, -60]
 handClosed = [70, 70, 70, 70, 50, -80]
 
 groundColor = ([75,70,68], [20,15,15])
-# ballColor as per-channel [min R,G,B], [max R,G,B]; a pixel is a ball pixel
-# when min <= channel <= max for all 3 channels.
-ballColor = ([87,76,57], [219,228,137])
+# ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
+# H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
+# for all 3 HSV channels.
+ballColor = ([20,40,80], [40,200,240])
 
 defaultCameraRequest = models.CameraFrameRequest(
             camera_settings=models.CameraSettings(
@@ -49,11 +50,12 @@ def main():
 
         # isBall = np.vectorize(lambda pix: (abs(pix[0] - ballColor[0][0]) < ballColor[1][0]) and (abs(pix[1] - ballColor[0][1]) < ballColor[1][1]) and (abs(pix[2] - ballColor[0][2]) < ballColor[1][2]))
         # isBallFrame = isBall(pix=(frame[:,:,0],frame[:,:,1],frame[:,:,2]))
-        frame0 = frame[:,:,0]
+        hsv = cv2.cvtColor(frame, cv2.COLOR_RGB2HSV)
+        frame0 = hsv[:,:,0]
         isBall0 = (frame0 >= ballColor[0][0]) & (frame0 <= ballColor[1][0])
-        frame1 = frame[:,:,1]
+        frame1 = hsv[:,:,1]
         isBall1 = (frame1 >= ballColor[0][1]) & (frame1 <= ballColor[1][1])
-        frame2 = frame[:,:,2]
+        frame2 = hsv[:,:,2]
         isBall2 = (frame2 >= ballColor[0][2]) & (frame2 <= ballColor[1][2])
 
         isBallFrame = isBall2 & isBall1 & isBall0
