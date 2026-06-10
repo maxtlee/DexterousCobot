@@ -13,6 +13,8 @@ from matplotlib import gridspec
 
 from ah_wrapper import AHSerialClient
 
+import pyrealsense2 as rs
+
 armA = (85*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
 armB = (95*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
 
@@ -24,26 +26,15 @@ handClosed = [70, 70, 70, 70, 50, -80]
 # for all 3 HSV channels.
 ballColor = ([21,89,68], [34,163,255])
 
-defaultCameraRequest = models.CameraFrameRequest(
-            camera_settings=models.CameraSettings(
-                brightness=0,
-                contrast=50,
-                exposure=350,
-                sharpness=50,
-                hue=0,
-                whiteBalance=4600,
-                autoWhiteBalance=True,
-            )
-        )
-
 def main():
-    with ArmClient() as arm:
+    with ArmClient() as arm, CamClient() as cam:
         # initArm(arm)
         # moveHand(hand, handOpen)
 
         # print(getBrightness(arm))
+        
+        frame = getCameraFrame(cam)
 
-        frame = getCameraFrame(arm)
         # print(frame.shape)
         # print(frame[360,640])
 
@@ -66,33 +57,24 @@ def main():
 
         # moveHand(hand, handClosed)
 
-def getCameraFrame(arm, cameraRequest = defaultCameraRequest): 
-    res = arm.camera.data.get_color_frame(cameraRequest)
-    raw_data = res.response.data
-    base64_data = raw_data.decode().split(",")[1]
-    image_data = base64.b64decode(base64_data)
-    np_byte_array = np.frombuffer(image_data, dtype=np.uint8)
-    pixel_array_bgr = cv2.imdecode(np_byte_array, cv2.IMREAD_COLOR)
-    pixel_array_rgb = cv2.cvtColor(pixel_array_bgr, cv2.COLOR_BGR2RGB)
-    return pixel_array_rgb
-
-def getBrightness(arm, cameraRequest = defaultCameraRequest
-    ): 
-    pixel_array_rgb = getCameraFrame(arm, cameraRequest)
-    flat = pixel_array_rgb.flatten()
-    avg = np.mean(flat)
-    return avg
-
-def getTennisBallLoc3D(arm, cameraRequest = defaultCameraRequest, 
-        tennisBallAcceptColors = ballColor
-    ): 
-    pixel_array_rgb = getCameraFrame(arm, cameraRequest)
-    # pixel_array_tennis_ball = 
-    pixel_array_tennis_ball = pixel_array_rgb > tennisBallAcceptColors[0] and pixel_array_rgb < tennisBallAcceptColors[1] #TODO: FIX SYNTAX
-    tennisBallLoc2D = fitCircleInArray(pixel_array_tennis_ball)
-    tennisBallOffset = 0 #TODO: Implement
-    tennisBallLoc3D = arm.getCamPose().TransformBy(tennisBallOffset) #TODO: Fix Syntax
-    return tennisBallLoc3D
+def getCameraFrame(cam): 
+    color = None
+    while not color:
+        frames = cam.wait_for_frames()
+        color = frames.get_color_frame()
+    frame = np.asanyarray(color.get_data())
+    return frame
+    
+# def getTennisBallLoc3D(arm, cameraRequest = defaultCameraRequest, 
+#         tennisBallAcceptColors = ballColor
+#     ): 
+#     pixel_array_rgb = getCameraFrame(arm, cameraRequest)
+#     # pixel_array_tennis_ball = 
+#     pixel_array_tennis_ball = pixel_array_rgb > tennisBallAcceptColors[0] and pixel_array_rgb < tennisBallAcceptColors[1] #TODO: FIX SYNTAX
+#     tennisBallLoc2D = fitCircleInArray(pixel_array_tennis_ball)
+#     tennisBallOffset = 0 #TODO: Implement
+#     tennisBallLoc3D = arm.getCamPose().TransformBy(tennisBallOffset) #TODO: Fix Syntax
+#     return tennisBallLoc3D
 
 # Returns a location (x,y) and diameter
 def fitCircleInArray(pixelArray):
@@ -139,6 +121,15 @@ class ArmClient:
     def __exit__(self, a, b, c):
         self.sdk.movement.brakes.brake().ok()
         self.sdk._request_manager.close()
+
+class CamClient:
+    def __enter__(self):
+        self.pipeline = rs.pipeline()
+        self.pipeline.start()
+        return self.pipeline
+
+    def __exit__(self, a, b, c):
+        self.pipeline.stop()
 
 if __name__ == "__main__":
     main()

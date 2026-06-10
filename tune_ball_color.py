@@ -13,7 +13,7 @@ so the values you pick transfer straight back into ``ballColor`` (stored as HSV
     isBall = (min <= channel <= max)   for all 3 HSV channels
 
 Usage:
-    .venv/bin/python tune_ball_color.py            # use the robot camera
+    .venv/bin/python tune_ball_color.py            # use the RealSense camera
     .venv/bin/python tune_ball_color.py --demo     # no hardware; synthetic image
     .venv/bin/python tune_ball_color.py --selftest # render one frame to PNG, exit
 
@@ -25,6 +25,7 @@ Keys (focus the window):
 """
 
 import argparse
+import os
 import threading
 import time
 
@@ -180,24 +181,27 @@ class CameraThread(threading.Thread):
                 time.sleep(0.03)
             return
         try:
-            from combinedtest import ArmClient, getCameraFrame
+            from combinedtest import CamClient, getCameraFrame
         except Exception as e:  # pragma: no cover - hardware deps
             self.error = "import combinedtest failed: %s" % e
             return
         try:
-            with ArmClient() as arm:
+            with CamClient() as cam:
                 while self.running:
                     if self.paused:
                         time.sleep(0.05)
                         continue
                     try:
-                        self._set(getCameraFrame(arm))
+                        # copy: getCameraFrame returns a view into the RealSense
+                        # frame buffer, which the SDK recycles on the next
+                        # wait_for_frames(); copy so this GUI keeps a stable image.
+                        self._set(getCameraFrame(cam).copy())
                         self.error = None
                     except Exception as e:
                         self.error = "camera read failed: %s" % e
                         time.sleep(0.2)
         except Exception as e:  # pragma: no cover - hardware deps
-            self.error = "robot connection failed: %s" % e
+            self.error = "camera open failed: %s" % e
 
 
 # --------------------------------------------------------------------------- #
@@ -244,7 +248,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--demo", action="store_true",
-                    help="use a synthetic moving image instead of the robot camera")
+                    help="use a synthetic moving image instead of the RealSense camera")
     ap.add_argument("--selftest", action="store_true",
                     help="render one frame to tuner_selftest.png and exit (no window)")
     ap.add_argument("--width", type=int, default=480,
@@ -254,6 +258,15 @@ def main():
     if args.selftest:
         run_selftest(args.demo)
         return
+
+    # The OpenCV/Qt GUI aborts the whole process (uncatchable) if it cannot
+    # reach a display, so check for one first and fail with a clear message.
+    if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
+        raise SystemExit(
+            "No display available (DISPLAY/WAYLAND_DISPLAY unset). The GUI needs "
+            "a desktop session; over SSH use X11 forwarding (ssh -X), or run on "
+            "the machine's own display.\n"
+            "To exercise the pipeline without a window, use --selftest.")
 
     cam = CameraThread(args.demo)
     cam.start()
