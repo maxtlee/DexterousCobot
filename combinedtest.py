@@ -19,11 +19,10 @@ armB = (95*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*
 handOpen = [40, 40, 40, 40, 20, -60]
 handClosed = [70, 70, 70, 70, 50, -80]
 
-groundColor = ([75,70,68], [20,15,15])
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
 # for all 3 HSV channels.
-ballColor = ([20,40,80], [40,200,240])
+ballColor = ([21,89,68], [34,163,255])
 
 defaultCameraRequest = models.CameraFrameRequest(
             camera_settings=models.CameraSettings(
