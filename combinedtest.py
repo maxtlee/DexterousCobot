@@ -49,11 +49,11 @@ def main():
 
         # isBall = np.vectorize(lambda pix: (abs(pix[0] - ballColor[0][0]) < ballColor[1][0]) and (abs(pix[1] - ballColor[0][1]) < ballColor[1][1]) and (abs(pix[2] - ballColor[0][2]) < ballColor[1][2]))
         # isBallFrame = isBall(pix=(frame[:,:,0],frame[:,:,1],frame[:,:,2]))
-        frame0 = frame[:,:,0]
+        frame0 = frame[:,:,0].astype(np.int16)
         isBall0 = abs(frame0 - ballColor[0][0]) < ballColor[1][0]
-        frame1 = frame[:,:,1]
+        frame1 = frame[:,:,1].astype(np.int16)
         isBall1 = abs(frame1 - ballColor[0][1]) < ballColor[1][1]
-        frame2 = frame[:,:,2]
+        frame2 = frame[:,:,2].astype(np.int16)
         isBall2 = abs(frame2 - ballColor[0][2]) < ballColor[1][2]
 
         isBallFrame = isBall2 & isBall1 & isBall0
