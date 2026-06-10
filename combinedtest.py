@@ -26,6 +26,19 @@ handClosed = [70, 70, 70, 70, 50, -80]
 # for all 3 HSV channels.
 ballColor = ([21,89,68], [34,163,255])
 
+# Camera settings the robot used to apply to this camera, now applied directly
+# to the RealSense RGB sensor. These are UVC controls and the values are already
+# on the RealSense scale (it is the same camera / same control ranges).
+cameraSettings = {
+    "brightness": 0,
+    "contrast": 50,
+    "exposure": 350,          # manual exposure; auto-exposure is turned off to apply it
+    "sharpness": 50,
+    "hue": 0,
+    "white_balance": 4600,
+    "auto_white_balance": True,
+}
+
 def main():
     with ArmClient() as arm, CamClient() as cam:
         # initArm(arm)
@@ -122,10 +135,49 @@ class ArmClient:
         self.sdk.movement.brakes.brake().ok()
         self.sdk._request_manager.close()
 
+def applyCameraConfig(profile, settings=cameraSettings):
+    """Apply the camera settings (UVC controls) to the RealSense RGB sensor.
+
+    Mirrors what the robot used to set when the camera was connected through it.
+    Each value is clamped into the option's supported range; auto-exposure is
+    disabled so the manual exposure takes effect, and white balance honours the
+    auto_white_balance flag.
+    """
+    color = next(s for s in profile.get_device().query_sensors()
+                 if s.get_info(rs.camera_info.name) == "RGB Camera")
+
+    def setOpt(option, value):
+        if not color.supports(option):
+            return
+        rng = color.get_option_range(option)
+        value = min(max(value, rng.min), rng.max)  # clamp into supported range
+        try:
+            color.set_option(option, float(value))
+        except Exception as e:
+            print(f"camera: could not set {option}: {e}")
+
+    # Manual exposure only takes effect once auto-exposure is off.
+    setOpt(rs.option.enable_auto_exposure, 0)
+    setOpt(rs.option.exposure, settings["exposure"])
+
+    # White balance: honour the auto flag; set a manual value only when auto off.
+    if settings["auto_white_balance"]:
+        setOpt(rs.option.enable_auto_white_balance, 1)
+    else:
+        setOpt(rs.option.enable_auto_white_balance, 0)
+        setOpt(rs.option.white_balance, settings["white_balance"])
+
+    setOpt(rs.option.brightness, settings["brightness"])
+    setOpt(rs.option.contrast, settings["contrast"])
+    setOpt(rs.option.sharpness, settings["sharpness"])
+    setOpt(rs.option.hue, settings["hue"])
+
+
 class CamClient:
     def __enter__(self):
         self.pipeline = rs.pipeline()
-        self.pipeline.start()
+        profile = self.pipeline.start()
+        applyCameraConfig(profile)
         return self.pipeline
 
     def __exit__(self, a, b, c):
