@@ -24,15 +24,15 @@ handClosed = [70, 70, 70, 70, 50, -80]
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
 # for all 3 HSV channels.
-ballColor = ([21,89,68], [34,163,255])
+ballColor = ([22,72,34], [56,205,196])
 
 # Camera settings the robot used to apply to this camera, now applied directly
 # to the RealSense RGB sensor. These are UVC controls and the values are already
 # on the RealSense scale (it is the same camera / same control ranges).
 cameraSettings = {
     "brightness": 0,
-    "contrast": 50,
-    "exposure": 350,          # manual exposure; auto-exposure is turned off to apply it
+    "contrast": 40,
+    "exposure": 100,          # manual exposure; auto-exposure is turned off to apply it
     "sharpness": 50,
     "hue": 0,
     "white_balance": 4600,
