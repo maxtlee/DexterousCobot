@@ -24,22 +24,42 @@ handClosed = [70, 70, 70, 70, 50, -80]
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
 # for all 3 HSV channels.
-ballColor = ([18,72,34], [56,205,196])
+ballColor = ([18,110,34], [56,205,196])
 
 ballDiameter = 0.065  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
 
+# Custom tooltip offset: the physical tool point (grasp point) in the frame
+# that get_arm_position() reports tooltip_position in. The robot keeps
+# reporting/targeting its own tooltip frame; getToolPointInBase() /
+# toolPointTargetToTooltip() apply this offset in code. Because camInTooltip
+# stays relative to the *reported* tooltip, changing this offset does not
+# invalidate the hand-eye calibration.
+tooltipOffset = np.eye(4)
+tooltipOffset[:3, 3] = [0.0, 0.12, -0.10]
+
 # Hand-eye extrinsics: pose of the RealSense *color* camera in the frame that
 # get_arm_position() reports tooltip_position in (4x4 homogeneous, meters).
 # Produced by calibrate_handeye.py, which writes camInTooltip.npy next to this
-# file. The identity fallback means "the camera sits exactly at the tooltip,
-# looking along its +Z" — fine for wiring tests, wrong for real grasps.
+# file. Until that exists, fall back to the hand-measured mounting offset:
+# Y-0.03 m, Z-0.07 m, roll -120 deg about the tooltip X axis; the camera is
+# mounted flipped 180 deg about its own optical (Z) axis.
+rollRad = np.deg2rad(-120)
+camInTooltipMeasured = np.eye(4)
+camInTooltipMeasured[:3, :3] = np.array(
+    [[1, 0, 0],
+     [0, np.cos(rollRad), -np.sin(rollRad)],
+     [0, np.sin(rollRad),  np.cos(rollRad)]]
+) #@ np.diag([-1.0, -1.0, 1.0])  # Rz(180): the 180-deg sensor flip
+camInTooltipMeasured[:3, 3] = [0.0, -0.03, -0.07]
+
 camInTooltipFile = Path(__file__).with_name("camInTooltip.npy")
 if camInTooltipFile.exists():
     camInTooltip = np.load(camInTooltipFile)
 else:
-    print("camInTooltip.npy not found; using identity (run calibrate_handeye.py)")
-    camInTooltip = np.eye(4)
+    print("camInTooltip.npy not found; using hand-measured camera offset "
+          "(run calibrate_handeye.py for a calibrated one)")
+    camInTooltip = camInTooltipMeasured
 
 metersPerUnit = {
     models.LinearUnitKind.Millimeters: 0.001,
@@ -168,14 +188,16 @@ def ballCenterInCam(center, diameterPx, depthM, intr):
     apparent size: with the true diameter known, range = fx * D / d_px.
     """
     cx, cy = center
-    depthSurf = sampleBallDepth(depthM, center, diameterPx / 2)
-    if depthSurf is not None:
-        # The sampled disc sees the front cap at z = Zcenter - R*cos(theta);
-        # the median over the inner 55% works out to Zcenter - ~0.92 R.
-        return np.array(rs.rs2_deproject_pixel_to_point(
-            intr, [cx, cy], depthSurf + 0.92 * ballRadius))
 
-    print("ball depth unavailable; falling back to apparent-size range")
+    # Depth is disabled for now because it is inaccurate at the desired range
+    # depthSurf = sampleBallDepth(depthM, center, diameterPx / 2)
+    # if depthSurf is not None:
+    #     # The sampled disc sees the front cap at z = Zcenter - R*cos(theta);
+    #     # the median over the inner 55% works out to Zcenter - ~0.92 R.
+    #     return np.array(rs.rs2_deproject_pixel_to_point(
+    #         intr, [cx, cy], depthSurf + 0.92 * ballRadius))
+
+    # print("ball depth unavailable; falling back to apparent-size range")
     ray = np.array(rs.rs2_deproject_pixel_to_point(intr, [cx, cy], 1.0))
     dist = intr.fx * ballDiameter / diameterPx  # range to the ball center
     return ray * (dist / np.linalg.norm(ray))
@@ -209,6 +231,16 @@ def getTooltipInBase(arm):
     T[:3, :3] = quatToMat(q.x, q.y, q.z, q.w)
     T[:3, 3] = np.array([tooltip.position.x, tooltip.position.y, tooltip.position.z]) * scale
     return T
+
+def getToolPointInBase(arm):
+    """Current physical tool point (tooltipOffset applied) as a 4x4 base-frame
+    transform (meters)."""
+    return getTooltipInBase(arm) @ tooltipOffset
+
+def toolPointTargetToTooltip(target):
+    """Reported-tooltip pose that puts the physical tool point at `target`
+    (4x4 base-frame pose). Pass the result to move_tooltip."""
+    return target @ np.linalg.inv(tooltipOffset)
 
 def quatToMat(x, y, z, w):
     n = np.sqrt(x*x + y*y + z*z + w*w)
