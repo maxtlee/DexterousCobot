@@ -50,7 +50,7 @@ camInTooltipMeasured[:3, :3] = np.array(
     [[1, 0, 0],
      [0, np.cos(rollRad), -np.sin(rollRad)],
      [0, np.sin(rollRad),  np.cos(rollRad)]]
-) #@ np.diag([-1.0, -1.0, 1.0])  # Rz(180): the 180-deg sensor flip
+) @ np.diag([-1.0, -1.0, 1.0])  # Rz(180): the 180-deg sensor flip
 camInTooltipMeasured[:3, 3] = [0.0, -0.03, -0.07]
 
 camInTooltipFile = Path(__file__).with_name("camInTooltip.npy")
