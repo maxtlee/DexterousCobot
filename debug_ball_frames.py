@@ -16,6 +16,12 @@ can be checked in isolation:
   * ball at a spot you can measure: base should match the tape measure, and
     tool reads (0, 0, 0) exactly when the grasp point touches the ball center.
 
+The kf column is a constant-velocity Kalman estimate of the base-frame
+position (combinedtest.BallKalman) with its largest per-axis std and speed;
+on missed detections it coasts on the velocity model while the std grows.
+Compare kf against raw base to judge how much smoothing/lag the current
+tuning (sigmaAccel/sigmaMeas) gives.
+
 SAFETY: read-only — never commands motion and never brakes/unbrakes the arm.
 Freedrive/jog the arm while it runs.
 
@@ -23,12 +29,14 @@ Usage:
     .venv/bin/python debug_ball_frames.py    (Ctrl+C to stop)
 """
 
+import time
+
 import numpy as np
 
 from calibrate_handeye import ArmReader
-from combinedtest import (CamClient, getFrames, getTooltipInBase, maskBall,
-                          fitCircleInArray, ballCenterInCam, camInTooltip,
-                          tooltipOffset)
+from combinedtest import (BallKalman, CamClient, getFrames, getTooltipInBase,
+                          maskBall, fitCircleInArray, ballCenterInCam,
+                          camInTooltip, tooltipOffset)
 
 toolFromTooltip = np.linalg.inv(tooltipOffset)
 
@@ -41,6 +49,8 @@ def fmt(p):
 
 def main():
     print("all positions in meters; Ctrl+C to stop")
+    kf = BallKalman()
+    lastT = time.monotonic()
     with ArmReader() as arm, CamClient() as cam:
         while True:
             # Frame first, pose second, back to back (same caveat as
@@ -52,18 +62,28 @@ def main():
                 frame, depthM, intr = getFrames(cam)
             tooltipInBase = getTooltipInBase(arm)
 
+            now = time.monotonic()
+            kf.predict(now - lastT)
+            lastT = now
+
             fit = fitCircleInArray(maskBall(frame))
             if fit is None:
-                print("ball: not found")
+                if kf.position is None:
+                    print("ball: not found")
+                else:  # coast on the model; sigma grows until the next detection
+                    print(f"ball: not found  kf base{fmt(kf.position)} "
+                          f"+-{kf.sigma.max():.3f}")
                 continue
 
             pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
             pTooltip = toFrame(camInTooltip, pCam)
             pTool = toFrame(toolFromTooltip, pTooltip)
             pBase = toFrame(tooltipInBase, pTooltip)
+            kf.update(pBase)
 
             print(f"cam{fmt(pCam)}  tooltip{fmt(pTooltip)}  tool{fmt(pTool)}  "
-                  f"base{fmt(pBase)}  range {np.linalg.norm(pCam):.3f} m")
+                  f"base{fmt(pBase)}  kf{fmt(kf.position)} "
+                  f"+-{kf.sigma.max():.3f}  v {np.linalg.norm(kf.velocity):.2f} m/s")
 
 if __name__ == "__main__":
     try:

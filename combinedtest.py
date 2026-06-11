@@ -24,7 +24,7 @@ handClosed = [70, 70, 70, 70, 50, -80]
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
 # for all 3 HSV channels.
-ballColor = ([18,110,34], [56,205,196])
+ballColor = ([9,110,20], [75,205,196])
 
 ballDiameter = 0.065  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
@@ -216,6 +216,75 @@ def sampleBallDepth(depthM, center, radiusPx):
     if samples.size < 10:
         return None
     return float(np.median(samples))
+
+class BallKalman:
+    """Constant-velocity Kalman filter for the ball center (meters).
+
+    Feed it base-frame measurements: ball motion is smooth in the world,
+    while camera-frame measurements jump whenever the arm moves, so filtering
+    in the base frame is what makes prediction across missed detections valid.
+
+    State is [position, velocity]; the first update() initializes it (zero
+    velocity, wide velocity covariance). Call predict(dt) once per cycle with
+    the elapsed time, then update(z) when there is a detection; on a miss just
+    skip update and the estimate coasts on velocity while sigma grows.
+
+    Tuning: sigmaMeas is the per-axis std of one measurement (~2 mm observed
+    at 0.3 m with stereo depth; raise it when the apparent-size fallback is
+    in play). sigmaAccel is the white-acceleration process noise — how hard
+    the ball might accelerate. Larger values trust new measurements more and
+    smooth less; ~1 m/s^2 suits a ball that is parked or carried by hand.
+    """
+
+    def __init__(self, sigmaAccel=1.0, sigmaMeas=0.005):
+        self.sigmaAccel = sigmaAccel
+        self.sigmaMeas = sigmaMeas
+        self.x = None  # [px, py, pz, vx, vy, vz]
+        self.P = None
+
+    def predict(self, dt):
+        """Advance the estimate by dt seconds. No-op before the first update."""
+        if self.x is None:
+            return
+        F = np.eye(6)
+        F[:3, 3:] = dt * np.eye(3)
+        I3 = np.eye(3)
+        Q = self.sigmaAccel ** 2 * np.block([
+            [dt ** 4 / 4 * I3, dt ** 3 / 2 * I3],
+            [dt ** 3 / 2 * I3, dt ** 2 * I3],
+        ])
+        self.x = F @ self.x
+        self.P = F @ self.P @ F.T + Q
+
+    def update(self, z):
+        """Fold in a measured base-frame ball position (3-vector, meters)."""
+        z = np.asarray(z, dtype=float)
+        if self.x is None:
+            self.x = np.concatenate([z, np.zeros(3)])
+            # Position known to measurement accuracy; velocity unknown (std 1 m/s).
+            self.P = np.diag([self.sigmaMeas ** 2] * 3 + [1.0] * 3)
+            return
+        # H selects position, so H P H^T = P[:3,:3] and P H^T = P[:,:3].
+        S = self.P[:3, :3] + self.sigmaMeas ** 2 * np.eye(3)
+        K = self.P[:, :3] @ np.linalg.inv(S)
+        self.x = self.x + K @ (z - self.x[:3])
+        self.P = self.P - K @ self.P[:3, :]
+        self.P = (self.P + self.P.T) / 2  # keep symmetric against roundoff
+
+    @property
+    def position(self):
+        """Estimated ball center (3-vector, m), or None before the first update."""
+        return None if self.x is None else self.x[:3].copy()
+
+    @property
+    def velocity(self):
+        """Estimated ball velocity (3-vector, m/s), or None before the first update."""
+        return None if self.x is None else self.x[3:].copy()
+
+    @property
+    def sigma(self):
+        """Per-axis position std (3-vector, m), or None before the first update."""
+        return None if self.P is None else np.sqrt(np.diag(self.P)[:3])
 
 def getTooltipInBase(arm):
     """Current tooltip pose as a 4x4 base-frame transform (meters)."""
