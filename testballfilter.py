@@ -1,11 +1,10 @@
-import json
 import numpy as np
 import cv2
 from pathlib import Path
 from standardbots import StandardBotsRobot, models
 from collections import deque
 import base64
-from time import sleep, monotonic
+from time import sleep
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -16,11 +15,11 @@ from ah_wrapper import AHSerialClient
 
 import pyrealsense2 as rs
 
-armHome = (-60*3.14/180, -25*3.14/180, 113*3.14/180, 126*3.14/180, -323*3.14/180, 147*3.14/180)
+armA = (85*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
+armB = (95*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
 
-handOpen = [2.5, 2.5, 2.5, 2.5, 2.5, -35]
-handMiddle = [30, 30, 30, 30, 2.5, -99]
-handClosed = [45, 45, 45, 45, 22, -99]
+handOpen = [40, 40, 40, 40, 20, -60]
+handClosed = [70, 70, 70, 70, 50, -80]
 
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
@@ -30,44 +29,29 @@ ballColor = ([9,110,20], [75,205,196])
 ballDiameter = 0.065  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
 
-# The hand-measured offsets below (grasp point and camera, measured in the
-# same session) turned out to be expressed in a tooltip frame whose X/Y axis
-# labels are yawed 90 deg from the frame the robot actually reports.
-# Diagnosed 2026-06-12: pushing the ball radially toward the base column made
-# the computed base position move tangentially (a pure vertical-axis yaw
-# error), while floor-plane and hand-projection tests had already pinned the
-# camera tilt and ruled out every other axis. tooltipFrameFix remaps every
-# hand-measured vector into the true frame. If a radial-motion test still
-# shows tangential drift (mirrored direction), the sign is wrong: use -90.
-tooltipFrameYaw = np.deg2rad(-90)
-tooltipFrameFix = np.array(
-    [[np.cos(tooltipFrameYaw), -np.sin(tooltipFrameYaw), 0],
-     [np.sin(tooltipFrameYaw),  np.cos(tooltipFrameYaw), 0],
-     [0, 0, 1]])
-
 # Custom tooltip offset: the physical tool point (grasp point) in the frame
 # that get_arm_position() reports tooltip_position in. The robot keeps
 # reporting/targeting its own tooltip frame; getToolPointInBase() /
 # toolPointTargetToTooltip() apply this offset in code. Because camInTooltip
 # stays relative to the *reported* tooltip, changing this offset does not
-# invalidate the hand-eye calibration. Measured: Y+0.12 m, Z-0.10 m.
+# invalidate the hand-eye calibration.
 tooltipOffset = np.eye(4)
-tooltipOffset[:3, 3] = tooltipFrameFix @ [-0.03, 0.08, -0.13]
+tooltipOffset[:3, 3] = [0.0, 0.12, -0.10]
 
 # Hand-eye extrinsics: pose of the RealSense *color* camera in the frame that
 # get_arm_position() reports tooltip_position in (4x4 homogeneous, meters).
 # Produced by calibrate_handeye.py, which writes camInTooltip.npy next to this
 # file. Until that exists, fall back to the hand-measured mounting offset:
-# Y-0.03 m, Z-0.07 m, roll -120 deg about the (measured) tooltip X axis; the
-# camera is mounted flipped 180 deg about its own optical (Z) axis.
+# Y-0.03 m, Z-0.07 m, roll -120 deg about the tooltip X axis; the camera is
+# mounted flipped 180 deg about its own optical (Z) axis.
 rollRad = np.deg2rad(-120)
 camInTooltipMeasured = np.eye(4)
-camInTooltipMeasured[:3, :3] = tooltipFrameFix @ np.array(
+camInTooltipMeasured[:3, :3] = np.array(
     [[1, 0, 0],
      [0, np.cos(rollRad), -np.sin(rollRad)],
      [0, np.sin(rollRad),  np.cos(rollRad)]]
 ) @ np.diag([-1.0, -1.0, 1.0])  # Rz(180): the 180-deg sensor flip
-camInTooltipMeasured[:3, 3] = tooltipFrameFix @ [0.0, -0.03, -0.07]
+camInTooltipMeasured[:3, 3] = [0.0, -0.03, -0.07]
 
 camInTooltipFile = Path(__file__).with_name("camInTooltip.npy")
 if camInTooltipFile.exists():
@@ -76,23 +60,6 @@ else:
     print("camInTooltip.npy not found; using hand-measured camera offset "
           "(run calibrate_handeye.py for a calibrated one)")
     camInTooltip = camInTooltipMeasured
-
-# Valid pickup region (axis-aligned box, base frame), taught by sweeping the
-# ball through valid/invalid positions with collect_ball_region.py. Without
-# it every reachable position counts as valid (the routine warns at startup).
-ballRegionFile = Path(__file__).with_name("ballRegion.json")
-if ballRegionFile.exists():
-    _region = json.loads(ballRegionFile.read_text())
-    ballRegionMin = np.array(_region["min"])
-    ballRegionMax = np.array(_region["max"])
-else:
-    ballRegionMin = ballRegionMax = None
-
-def isValidBallPosition(p):
-    """True when p (base-frame xyz, m) is inside the taught valid region."""
-    if ballRegionMin is None:
-        return True
-    return bool(np.all(p >= ballRegionMin) and np.all(p <= ballRegionMax))
 
 metersPerUnit = {
     models.LinearUnitKind.Millimeters: 0.001,
@@ -115,135 +82,21 @@ cameraSettings = {
     "auto_white_balance": True,
 }
 
-# --- pickup-routine tuning
-waitingStableS = 0.5          # ball must be valid + stationary this long
-stationaryTolM = 0.02         # max kf wander allowed within that window
-reachedTolRad = np.deg2rad(1.0)   # per-joint |current - target| = "arrived"
-retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
-handActuateS = 0.4            # settle time after each hand command
-routineSpeedScale = 1.0       # conservative speed for autonomous motion
-homeTimeoutS = 20.0
-
 def main():
-    """Infinite pickup cycle: wait for a valid, stationary ball -> move to it
-    with continuous Kalman-based retargeting -> grasp -> deliver home -> drop
-    -> wait again. Aborts home whenever the ball estimate leaves the taught
-    valid region (or becomes unreachable)."""
-    if ballRegionMin is None:
-        print("WARNING: no ballRegion.json — every reachable position counts "
-              "as valid. Teach the region with collect_ball_region.py.")
+    with ArmClient() as arm, CamClient() as cam:
+        # initArm(arm)
+        # moveHand(hand, handOpen)
 
-    with ArmClient() as arm, CamClient() as cam, HandClient() as hand:
-        initArm(arm)
-        moveHand(hand, handOpen)
-        goHome(arm)
-        kf = BallKalman()
-        history = deque()       # (t, kf position) while continuously valid
-        lastSent = None
-        state = "waiting"
-        lastT = monotonic()
-        print("waiting for a ball...")
+        pose = getTennisBallPose(arm, cam, debug=True)
+        if pose is None:
+            print("tennis ball: not found")
+        else:
+            position, orientation = pose
+            print("tennis ball position (m, robot base frame):",
+                  np.array2string(position, precision=4, suppress_small=True))
+            print("tennis ball orientation (quaternion xyzw, placeholder):", orientation)
 
-        while True:
-            lastT, detected, joints = perceiveBall(arm, cam, kf, lastT)
-            pos = kf.position
-            target = None
-            if pos is not None and isValidBallPosition(pos):
-                target = ballJointTarget(pos, joints)
-
-            if state == "waiting":
-                if detected and target is not None:
-                    history.append((lastT, pos.copy()))
-                    while history and lastT - history[0][0] > waitingStableS + 0.2:
-                        history.popleft()
-                    pts = np.array([p for _, p in history])
-                    if (lastT - history[0][0] >= waitingStableS
-                            and np.linalg.norm(pts.max(0) - pts.min(0)) < stationaryTolM):
-                        print(f"ball stable at {np.round(pos, 3)} -> moving")
-                        state, lastSent = "moving", None
-                else:
-                    history.clear()
-
-            elif state == "moving":
-                if target is None:
-                    print("ball left the valid region -> returning home")
-                    goHome(arm)
-                    kf, lastSent, state = BallKalman(), None, "waiting"
-                    history.clear()
-                    print("waiting for a ball...")
-                elif armReached(joints, target):
-                    graspAndDeliver(arm, hand)
-                    kf, lastSent, state = BallKalman(), None, "waiting"
-                    history.clear()
-                    print("waiting for a ball...")
-                elif (lastSent is None
-                        or np.max(np.abs(target - lastSent)) > retargetTolRad):
-                    if moveArm(arm, target, speedScale=routineSpeedScale):
-                        lastSent = target
-
-def perceiveBall(arm, cam, kf, lastT):
-    """One vision tick: predict the kf and fold in a detection when there is
-    one. Measurements are accepted while the arm moves: there is no hardware
-    sync between frame and pose, so a mid-motion measurement is stale by up
-    to a frame time (a few mm at the routine's speed scale) — but folding
-    them in is what lets the target keep refining as the camera closes in,
-    and lets the routine follow a ball that is moved mid-approach. Detections
-    clipped by the frame edge are rejected in fitCircleInArray; on any miss
-    (occlusion by the hand included) the zero-velocity kf just coasts.
-
-    Returns (timestamp, updated: bool, current joints)."""
-    for _ in range(2):  # flush so the frame is current
-        frame, depthM, intr = getFrames(cam)
-    T, joints = getArmState(arm)  # right after the grab: minimal frame/pose skew
-
-    now = monotonic()
-    kf.predict(now - lastT)
-
-    fit = fitCircleInArray(maskBall(frame))
-    if fit is None:
-        return now, False, joints
-
-    pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
-    kf.update((T @ camInTooltip @ np.append(pCam, 1.0))[:3])
-    return now, True, joints
-
-def armReached(current, target, tol=reachedTolRad):
-    """True when every joint is within tol of the target (2*pi-wrapped)."""
-    d = np.abs(np.asarray(current) - np.asarray(target)) % (2 * np.pi)
-    return bool(np.max(np.minimum(d, 2 * np.pi - d)) < tol)
-
-def goHome(arm):
-    moveArm(arm, armHome, speedScale=routineSpeedScale)
-    waitUntilReached(arm, armHome)
-
-def waitUntilReached(arm, target, timeoutS=homeTimeoutS):
-    t0 = monotonic()
-    while monotonic() - t0 < timeoutS:
-        if armReached(getArmJoints(arm), target):
-            return True
-        sleep(0.1)
-    print(f"warning: arm did not reach the target within {timeoutS:.0f} s")
-    return False
-
-def graspAndDeliver(arm, hand):
-    print("at the ball -> grasping")
-    moveHand(hand, handMiddle)
-    sleep(handActuateS)
-    moveHand(hand, handClosed)
-    sleep(handActuateS)
-    print("delivering home")
-    goHome(arm)
-    releaseHand(hand)
-    print("dropped — reset the ball to run another cycle")
-
-def releaseHand(hand):
-    """Drop the ball: open, then close, then open again. Gripping can trip a
-    finger's current limit, which soft-locks it against moving further in
-    that direction; the extra close/open cycle drives every finger through
-    both directions so no lock survives into the next grasp."""
-    for position in (handOpen, handClosed, handOpen):
-        moveHand(hand, position)
-        sleep(handActuateS)
+        # moveHand(hand, handClosed)
 
 def getTennisBallPose(arm, cam, debug=False):
     """Absolute 6-DoF pose of the tennis ball in the robot base frame.
@@ -303,9 +156,7 @@ def fitCircleInArray(pixelArray):
     through; a circularity gate rejects non-ball blobs (carpet streaks). The
     minimum enclosing circle sets the size: unlike an area-equivalent radius
     it stays close to the true diameter when the gripper occludes part of
-    the ball. Balls clipped by the frame edge are rejected outright: a
-    truncated disc fits a circle with a corrupted center and diameter, and
-    with apparent-size ranging a wrong diameter means a wrong distance.
+    the ball.
     """
     mask = (np.asarray(pixelArray) > 0).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -325,10 +176,6 @@ def fitCircleInArray(pixelArray):
         return None
 
     (x, y), radius = cv2.minEnclosingCircle(contour)
-    h, w = mask.shape
-    if (x - radius < 2 or y - radius < 2
-            or x + radius > w - 2 or y + radius > h - 2):
-        return None  # clipped by the frame edge
     return ((x, y), 2 * radius)
 
 def ballCenterInCam(center, diameterPx, depthM, intr):
@@ -436,9 +283,8 @@ class BallKalman:
         """Per-axis position std (3-vector, m), or None before the first update."""
         return None if self.P is None else np.sqrt(np.diag(self.P))
 
-def getArmState(arm):
-    """(tooltip pose as 4x4 base-frame transform, joints as 6-vector of
-    radians) from a single get_arm_position call."""
+def getTooltipInBase(arm):
+    """Current tooltip pose as a 4x4 base-frame transform (meters)."""
     combined = arm.movement.position.get_arm_position().ok()
     tooltip = combined.tooltip_position
     if (tooltip is None or tooltip.position is None
@@ -450,11 +296,7 @@ def getArmState(arm):
     T = np.eye(4)
     T[:3, :3] = quatToMat(q.x, q.y, q.z, q.w)
     T[:3, 3] = np.array([tooltip.position.x, tooltip.position.y, tooltip.position.z]) * scale
-    return T, np.array(combined.joint_rotations, dtype=float)
-
-def getTooltipInBase(arm):
-    """Current tooltip pose as a 4x4 base-frame transform (meters)."""
-    return getArmState(arm)[0]
+    return T
 
 def getToolPointInBase(arm):
     """Current physical tool point (tooltipOffset applied) as a 4x4 base-frame
@@ -465,91 +307,6 @@ def toolPointTargetToTooltip(target):
     """Reported-tooltip pose that puts the physical tool point at `target`
     (4x4 base-frame pose). Pass the result to move_tooltip."""
     return target @ np.linalg.inv(tooltipOffset)
-
-# Arm geometry for ballJointTarget, fitted against the robot's own FK
-# endpoint (/api/v1/poses/joint-pose) on 2026-06-12 over a 36-pose grid with
-# the wrist held level (J1+J2+J3 = 180 deg, J4 = -270 deg, J5 = 180 deg).
-# In that configuration the tooltip orientation is the identity (level) to
-# 0.21 deg, J0 is a pure base-Z rotation, and the J1/J2/J3 pitch axes are
-# parallel: the tooltip in the frame rotating with J0 is
-#   radial   r = a2*sin(J1+b1) + a3*sin(J1+J2+b2) + rConst
-#   vertical z = a2*cos(J1+b1) + a3*cos(J1+J2+b2) + zConst
-#   lateral  y = yConst
-# In-plane fit residual < 3 um; the lateral constant wobbles ~3 mm across the
-# workspace (factory-calibrated, slightly non-ideal axes) — that is the
-# accuracy floor of this model.
-armLevelSum = np.pi          # J1+J2+J3 that keeps the wrist level
-armUpperArm = 0.591138       # a2 (m), J1 -> J2
-armForearm = 0.549556        # a3 (m), J2 -> J3
-armJ1Zero = 0.00538457       # b1 (rad), joint-zero calibration offset
-armJ12Zero = -0.00413454     # b2 (rad)
-armRadialConst = 0.162179    # rConst (m), tooltip chain (without tooltipOffset)
-armLateralConst = 0.193491   # yConst (m)
-armVerticalConst = 0.021837  # zConst (m)
-
-def ballJointTarget(ball, currentJoints,
-                    j4=np.deg2rad(-270), j5=np.deg2rad(180)):
-    """6-joint target (radians) placing the grasp point at `ball` (base frame, m).
-
-    The wrist is fully constrained by design: J5 and J4 are held at the given
-    values (defaults match armA/armB) and J3 takes whatever angle keeps the
-    arm level (J1+J2+J3 = armLevelSum). Under that constraint the grasp point
-    sits at a constant offset from the wrist in the frame rotating with J0,
-    so the wrist position is backcalculated from the ball position, and
-    J0/J1/J2 follow from the lateral-offset shoulder solution plus standard
-    planar two-link IK. Of the up-to-4 solutions (shoulder front/back x
-    elbow up/down, each also wrapped by 2*pi toward the current pose) the one
-    with the smallest total absolute joint difference from currentJoints is
-    returned, or None when the ball is out of reach.
-
-    Joint limits are not checked here; the robot rejects an infeasible target
-    when it is commanded.
-    """
-    ball = np.asarray(ball, dtype=float)
-    current = np.asarray(currentJoints, dtype=float)
-
-    # Grasp-point chain constants: tooltipOffset's translation is expressed in
-    # the level tooltip frame, which is axis-aligned with the rotating frame.
-    rT = armRadialConst + tooltipOffset[0, 3]
-    yL = armLateralConst + tooltipOffset[1, 3]
-    zC = armVerticalConst + tooltipOffset[2, 3]
-
-    candidates = []
-    lat2 = ball[0] ** 2 + ball[1] ** 2 - yL ** 2
-    if lat2 > 0:
-        azimuth = np.arctan2(ball[1], ball[0])
-        for rSign in (1.0, -1.0):  # grasp point in front of / behind the J0 axis
-            r = rSign * np.sqrt(lat2)
-            q0 = azimuth - np.arctan2(yL, r)
-            rr, zz = r - rT, ball[2] - zC
-            cosElbow = ((rr ** 2 + zz ** 2 - armUpperArm ** 2 - armForearm ** 2)
-                        / (2 * armUpperArm * armForearm))
-            if abs(cosElbow) > 1:
-                continue
-            for elbow in (1.0, -1.0):
-                g = elbow * np.arccos(cosElbow)  # angle J2 (forearm vs upper arm)
-                u1 = (np.arctan2(rr, zz)
-                      - np.arctan2(armForearm * np.sin(g),
-                                   armUpperArm + armForearm * np.cos(g)))
-                q1 = u1 - armJ1Zero
-                q2 = g + armJ1Zero - armJ12Zero
-                q3 = armLevelSum - q1 - q2  # level the wrist
-                candidates.append([q0, q1, q2, q3, j4, j5])
-
-    best, bestCost = None, np.inf
-    for cand in candidates:
-        q = np.array(cand)
-        # A joint shifted by 2*pi is the same physical pose; compare the
-        # representative nearest the current angle (J4/J5 stay as given).
-        q[:4] -= 2 * np.pi * np.round((q[:4] - current[:4]) / (2 * np.pi))
-        cost = np.abs(q - current).sum()
-        if cost < bestCost:
-            best, bestCost = q, cost
-    return best
-
-def getArmJoints(arm):
-    """Current joint rotations J0..J5 (radians) as a 6-vector."""
-    return getArmState(arm)[1]
 
 def quatToMat(x, y, z, w):
     n = np.sqrt(x*x + y*y + z*z + w*w)
@@ -580,43 +337,16 @@ def getCameraFrame(cam):
     """RGB frame only (kept for tune_ball_color.py)."""
     return getFrames(cam)[0]
 
-_lastRejection = None
-
-def moveArm(arm, position, speedScale=None):
-    """Send a joint-space target. Returns True when the robot accepted it.
-
-    Re-sending while a previous move is executing is also how the routine
-    retargets mid-flight: the API has no cancel endpoint (verified:
-    routine-editor/stop demands a running routine, emergency-stop faults the
-    arm), so the new target either preempts the old one or — if the firmware
-    queues/rejects mid-motion sends — takes effect when the current leg ends
-    (run check_preemption.py to see which). Rejections are printed once per
-    distinct message (not per retry tick) and reported as False.
-
-    speedScale (0..1) scales the default speed profile; the pickup routine
-    uses a conservative value.
-    """
-    global _lastRejection
-    profile = None
-    if speedScale is not None:
-        profile = models.SpeedProfile(scaling_factor=float(speedScale))
+def moveArm(arm, position):
     body = models.ArmPositionUpdateRequest(
         kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(
-            joints=tuple(float(j) for j in position)),
-        speed_profile=profile,
+        joint_rotation=models.ArmJointRotations(joints=position),
     )
     response = arm.movement.position.set_arm_position(body)
     try:
-        response.ok()
-        _lastRejection = None
-        return True
+        print(response.ok())
     except Exception:
-        message = getattr(response.data, "message", response.data)
-        if message != _lastRejection:
-            print("moveArm rejected:", message)
-            _lastRejection = message
-        return False
+        print(response.data.message)
 
 def initArm(arm):
     arm.movement.brakes.unbrake().ok()
@@ -624,25 +354,12 @@ def initArm(arm):
     arm.recovery.recover.recover().ok()
 
 def moveHand(hand, position):
-    """Set the hand target; the client's write thread streams it to the hand.
-
-    A single send is not enough: the Ability Hand drops out of API mode (and
-    snaps back to its firmware-default grip) the moment commands stop
-    arriving. The AHSerialClient write thread re-sends the current target at
-    rate_hz, which is what actually holds a position — including the closed
-    grip while the arm carries the ball home. set_position only swaps the
-    streamed command (thread-safe), so this returns immediately.
-    """
     hand.set_position(positions=position, reply_mode=2)
+    hand.send_command()
 
 class HandClient:
     def __enter__(self):
-        # The constructor pre-loads a half-closed default target
-        # (set_position(30)), so load handOpen before the write thread
-        # starts streaming — connecting must not move the hand.
-        self.hand = AHSerialClient(auto_start_threads=False)
-        self.hand.set_position(positions=handOpen, reply_mode=2)
-        self.hand.start_threads()
+        self.hand = AHSerialClient(write_thread=False)
         return self.hand
 
     def __exit__(self,a,b,c):
