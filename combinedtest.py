@@ -120,8 +120,6 @@ waitingStableS = 0.5          # ball must be valid + stationary this long
 stationaryTolM = 0.02         # max kf wander allowed within that window
 reachedTolRad = np.deg2rad(3.0)   # per-joint |current - target| = "arrived"
 retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
-armStillTolM = 0.003          # skip kf updates when the tooltip moved more
-armStillTolRad = np.deg2rad(0.5)  # ... or rotated more during the frame grab
 handActuateS = 1.5            # settle time after each hand command
 routineSpeedScale = 0.3       # conservative speed for autonomous motion
 homeTimeoutS = 20.0
@@ -184,30 +182,29 @@ def main():
                         lastSent = target
 
 def perceiveBall(arm, cam, kf, lastT):
-    """One vision tick: predict the kf, update it with a detection when the
-    arm held still across the frame grab (no hardware sync, so measurements
-    taken mid-motion are stale by a frame and would corrupt the estimate;
-    skipping them lets the zero-velocity kf coast — which also covers the
-    hand occluding the ball during the final approach).
+    """One vision tick: predict the kf and fold in a detection when there is
+    one. Measurements are accepted while the arm moves: there is no hardware
+    sync between frame and pose, so a mid-motion measurement is stale by up
+    to a frame time (a few mm at the routine's speed scale) — but folding
+    them in is what lets the target keep refining as the camera closes in,
+    and lets the routine follow a ball that is moved mid-approach. Detections
+    clipped by the frame edge are rejected in fitCircleInArray; on any miss
+    (occlusion by the hand included) the zero-velocity kf just coasts.
 
     Returns (timestamp, updated: bool, current joints)."""
-    T1, _ = getArmState(arm)
     for _ in range(2):  # flush so the frame is current
         frame, depthM, intr = getFrames(cam)
-    T2, joints = getArmState(arm)
+    T, joints = getArmState(arm)  # right after the grab: minimal frame/pose skew
 
     now = monotonic()
     kf.predict(now - lastT)
 
-    armMoved = (np.linalg.norm(T1[:3, 3] - T2[:3, 3]) > armStillTolM
-                or np.arccos(np.clip((np.trace(T1[:3, :3].T @ T2[:3, :3]) - 1) / 2,
-                                     -1, 1)) > armStillTolRad)
-    fit = None if armMoved else fitCircleInArray(maskBall(frame))
+    fit = fitCircleInArray(maskBall(frame))
     if fit is None:
         return now, False, joints
 
     pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
-    kf.update((T2 @ camInTooltip @ np.append(pCam, 1.0))[:3])
+    kf.update((T @ camInTooltip @ np.append(pCam, 1.0))[:3])
     return now, True, joints
 
 def armReached(current, target, tol=reachedTolRad):
@@ -298,7 +295,9 @@ def fitCircleInArray(pixelArray):
     through; a circularity gate rejects non-ball blobs (carpet streaks). The
     minimum enclosing circle sets the size: unlike an area-equivalent radius
     it stays close to the true diameter when the gripper occludes part of
-    the ball.
+    the ball. Balls clipped by the frame edge are rejected outright: a
+    truncated disc fits a circle with a corrupted center and diameter, and
+    with apparent-size ranging a wrong diameter means a wrong distance.
     """
     mask = (np.asarray(pixelArray) > 0).astype(np.uint8) * 255
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -318,6 +317,10 @@ def fitCircleInArray(pixelArray):
         return None
 
     (x, y), radius = cv2.minEnclosingCircle(contour)
+    h, w = mask.shape
+    if (x - radius < 2 or y - radius < 2
+            or x + radius > w - 2 or y + radius > h - 2):
+        return None  # clipped by the frame edge
     return ((x, y), 2 * radius)
 
 def ballCenterInCam(center, diameterPx, depthM, intr):
@@ -569,14 +572,23 @@ def getCameraFrame(cam):
     """RGB frame only (kept for tune_ball_color.py)."""
     return getFrames(cam)[0]
 
+_lastRejection = None
+
 def moveArm(arm, position, speedScale=None):
     """Send a joint-space target. Returns True when the robot accepted it.
 
+    Re-sending while a previous move is executing is also how the routine
+    retargets mid-flight: the API has no cancel endpoint (verified:
+    routine-editor/stop demands a running routine, emergency-stop faults the
+    arm), so the new target either preempts the old one or — if the firmware
+    queues/rejects mid-motion sends — takes effect when the current leg ends
+    (run check_preemption.py to see which). Rejections are printed once per
+    distinct message (not per retry tick) and reported as False.
+
     speedScale (0..1) scales the default speed profile; the pickup routine
-    uses a conservative value. Rejections (e.g. while a previous motion is
-    still executing, depending on firmware semantics) are printed and
-    reported as False — callers retry on the next loop tick.
+    uses a conservative value.
     """
+    global _lastRejection
     profile = None
     if speedScale is not None:
         profile = models.SpeedProfile(scaling_factor=float(speedScale))
@@ -589,9 +601,13 @@ def moveArm(arm, position, speedScale=None):
     response = arm.movement.position.set_arm_position(body)
     try:
         response.ok()
+        _lastRejection = None
         return True
     except Exception:
-        print("moveArm rejected:", getattr(response.data, "message", response.data))
+        message = getattr(response.data, "message", response.data)
+        if message != _lastRejection:
+            print("moveArm rejected:", message)
+            _lastRejection = message
         return False
 
 def initArm(arm):
