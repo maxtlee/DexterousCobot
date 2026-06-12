@@ -52,7 +52,7 @@ tooltipFrameFix = np.array(
 # stays relative to the *reported* tooltip, changing this offset does not
 # invalidate the hand-eye calibration. Measured: Y+0.12 m, Z-0.10 m.
 tooltipOffset = np.eye(4)
-tooltipOffset[:3, 3] = tooltipFrameFix @ [-0.05, 0.12, -0.13]
+tooltipOffset[:3, 3] = tooltipFrameFix @ [-0.03, 0.08, -0.13]
 
 # Hand-eye extrinsics: pose of the RealSense *color* camera in the frame that
 # get_arm_position() reports tooltip_position in (4x4 homogeneous, meters).
@@ -118,7 +118,7 @@ cameraSettings = {
 # --- pickup-routine tuning
 waitingStableS = 0.5          # ball must be valid + stationary this long
 stationaryTolM = 0.02         # max kf wander allowed within that window
-reachedTolRad = np.deg2rad(3.0)   # per-joint |current - target| = "arrived"
+reachedTolRad = np.deg2rad(1.0)   # per-joint |current - target| = "arrived"
 retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
 handActuateS = 1.5            # settle time after each hand command
 routineSpeedScale = 0.3       # conservative speed for autonomous motion
@@ -233,9 +233,17 @@ def graspAndDeliver(arm, hand):
     sleep(handActuateS)
     print("delivering home")
     goHome(arm)
-    moveHand(hand, handOpen)
-    sleep(handActuateS)
+    releaseHand(hand)
     print("dropped — reset the ball to run another cycle")
+
+def releaseHand(hand):
+    """Drop the ball: open, then close, then open again. Gripping can trip a
+    finger's current limit, which soft-locks it against moving further in
+    that direction; the extra close/open cycle drives every finger through
+    both directions so no lock survives into the next grasp."""
+    for position in (handOpen, handClosed, handOpen):
+        moveHand(hand, position)
+        sleep(handActuateS)
 
 def getTennisBallPose(arm, cam, debug=False):
     """Absolute 6-DoF pose of the tennis ball in the robot base frame.
