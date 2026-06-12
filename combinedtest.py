@@ -308,6 +308,92 @@ def toolPointTargetToTooltip(target):
     (4x4 base-frame pose). Pass the result to move_tooltip."""
     return target @ np.linalg.inv(tooltipOffset)
 
+# Arm geometry for ballJointTarget, fitted against the robot's own FK
+# endpoint (/api/v1/poses/joint-pose) on 2026-06-12 over a 36-pose grid with
+# the wrist held level (J1+J2+J3 = 180 deg, J4 = -270 deg, J5 = 180 deg).
+# In that configuration the tooltip orientation is the identity (level) to
+# 0.21 deg, J0 is a pure base-Z rotation, and the J1/J2/J3 pitch axes are
+# parallel: the tooltip in the frame rotating with J0 is
+#   radial   r = a2*sin(J1+b1) + a3*sin(J1+J2+b2) + rConst
+#   vertical z = a2*cos(J1+b1) + a3*cos(J1+J2+b2) + zConst
+#   lateral  y = yConst
+# In-plane fit residual < 3 um; the lateral constant wobbles ~3 mm across the
+# workspace (factory-calibrated, slightly non-ideal axes) — that is the
+# accuracy floor of this model.
+armLevelSum = np.pi          # J1+J2+J3 that keeps the wrist level
+armUpperArm = 0.591138       # a2 (m), J1 -> J2
+armForearm = 0.549556        # a3 (m), J2 -> J3
+armJ1Zero = 0.00538457       # b1 (rad), joint-zero calibration offset
+armJ12Zero = -0.00413454     # b2 (rad)
+armRadialConst = 0.162179    # rConst (m), tooltip chain (without tooltipOffset)
+armLateralConst = 0.193491   # yConst (m)
+armVerticalConst = 0.021837  # zConst (m)
+
+def ballJointTarget(ball, currentJoints,
+                    j4=np.deg2rad(-270), j5=np.deg2rad(180)):
+    """6-joint target (radians) placing the grasp point at `ball` (base frame, m).
+
+    The wrist is fully constrained by design: J5 and J4 are held at the given
+    values (defaults match armA/armB) and J3 takes whatever angle keeps the
+    arm level (J1+J2+J3 = armLevelSum). Under that constraint the grasp point
+    sits at a constant offset from the wrist in the frame rotating with J0,
+    so the wrist position is backcalculated from the ball position, and
+    J0/J1/J2 follow from the lateral-offset shoulder solution plus standard
+    planar two-link IK. Of the up-to-4 solutions (shoulder front/back x
+    elbow up/down, each also wrapped by 2*pi toward the current pose) the one
+    with the smallest total absolute joint difference from currentJoints is
+    returned, or None when the ball is out of reach.
+
+    Joint limits are not checked here; the robot rejects an infeasible target
+    when it is commanded.
+    """
+    ball = np.asarray(ball, dtype=float)
+    current = np.asarray(currentJoints, dtype=float)
+
+    # Grasp-point chain constants: tooltipOffset's translation is expressed in
+    # the level tooltip frame, which is axis-aligned with the rotating frame.
+    rT = armRadialConst + tooltipOffset[0, 3]
+    yL = armLateralConst + tooltipOffset[1, 3]
+    zC = armVerticalConst + tooltipOffset[2, 3]
+
+    candidates = []
+    lat2 = ball[0] ** 2 + ball[1] ** 2 - yL ** 2
+    if lat2 > 0:
+        azimuth = np.arctan2(ball[1], ball[0])
+        for rSign in (1.0, -1.0):  # grasp point in front of / behind the J0 axis
+            r = rSign * np.sqrt(lat2)
+            q0 = azimuth - np.arctan2(yL, r)
+            rr, zz = r - rT, ball[2] - zC
+            cosElbow = ((rr ** 2 + zz ** 2 - armUpperArm ** 2 - armForearm ** 2)
+                        / (2 * armUpperArm * armForearm))
+            if abs(cosElbow) > 1:
+                continue
+            for elbow in (1.0, -1.0):
+                g = elbow * np.arccos(cosElbow)  # angle J2 (forearm vs upper arm)
+                u1 = (np.arctan2(rr, zz)
+                      - np.arctan2(armForearm * np.sin(g),
+                                   armUpperArm + armForearm * np.cos(g)))
+                q1 = u1 - armJ1Zero
+                q2 = g + armJ1Zero - armJ12Zero
+                q3 = armLevelSum - q1 - q2  # level the wrist
+                candidates.append([q0, q1, q2, q3, j4, j5])
+
+    best, bestCost = None, np.inf
+    for cand in candidates:
+        q = np.array(cand)
+        # A joint shifted by 2*pi is the same physical pose; compare the
+        # representative nearest the current angle (J4/J5 stay as given).
+        q[:4] -= 2 * np.pi * np.round((q[:4] - current[:4]) / (2 * np.pi))
+        cost = np.abs(q - current).sum()
+        if cost < bestCost:
+            best, bestCost = q, cost
+    return best
+
+def getArmJoints(arm):
+    """Current joint rotations J0..J5 (radians) as a 6-vector."""
+    combined = arm.movement.position.get_arm_position().ok()
+    return np.array(combined.joint_rotations, dtype=float)
+
 def quatToMat(x, y, z, w):
     n = np.sqrt(x*x + y*y + z*z + w*w)
     x, y, z, w = x/n, y/n, z/n, w/n

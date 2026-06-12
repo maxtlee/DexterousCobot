@@ -22,6 +22,12 @@ on missed detections the estimate stays put while the std grows. Compare kf
 against raw base to judge how much smoothing/lag the current tuning
 (sigmaWalk/sigmaMeas) gives.
 
+The jt column is the 6-joint movement target (degrees, J0..J5) that would
+put the grasp point at the kf estimate, from combinedtest.ballJointTarget:
+wrist level (J1+J2+J3 = 180 deg), J4 = -270 deg, J5 = 180 deg, nearest of
+the IK solutions to the arm's current joints. Display only — this script
+still never commands motion.
+
 SAFETY: read-only — never commands motion and never brakes/unbrakes the arm.
 Freedrive/jog the arm while it runs.
 
@@ -34,9 +40,10 @@ import time
 import numpy as np
 
 from calibrate_handeye import ArmReader
-from combinedtest import (BallKalman, CamClient, getFrames, getTooltipInBase,
-                          maskBall, fitCircleInArray, ballCenterInCam,
-                          camInTooltip, tooltipOffset)
+from combinedtest import (BallKalman, CamClient, ballJointTarget, getArmJoints,
+                          getFrames, getTooltipInBase, maskBall,
+                          fitCircleInArray, ballCenterInCam, camInTooltip,
+                          tooltipOffset)
 
 toolFromTooltip = np.linalg.inv(tooltipOffset)
 
@@ -46,6 +53,14 @@ def toFrame(T, p):
 def fmt(p):
     return np.array2string(p, precision=3, suppress_small=True,
                            floatmode="fixed")
+
+def jointTargetStr(arm, kf):
+    """Joint target (deg) that would put the grasp point at the kf estimate."""
+    target = ballJointTarget(kf.position, getArmJoints(arm))
+    if target is None:
+        return "jt: unreachable"
+    return "jt" + np.array2string(np.degrees(target), precision=1,
+                                  suppress_small=True, floatmode="fixed") + " deg"
 
 def main():
     print("all positions in meters; Ctrl+C to stop")
@@ -72,7 +87,7 @@ def main():
                     print("ball: not found")
                 else:  # zero-velocity model: estimate holds, sigma grows
                     print(f"ball: not found  kf base{fmt(kf.position)} "
-                          f"+-{kf.sigma.max():.3f}")
+                          f"+-{kf.sigma.max():.3f}  {jointTargetStr(arm, kf)}")
                 continue
 
             pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
@@ -83,7 +98,7 @@ def main():
 
             print(f"cam{fmt(pCam)}  tooltip{fmt(pTooltip)}  tool{fmt(pTool)}  "
                   f"base{fmt(pBase)}  kf{fmt(kf.position)} "
-                  f"+-{kf.sigma.max():.3f}")
+                  f"+-{kf.sigma.max():.3f}  {jointTargetStr(arm, kf)}")
 
 if __name__ == "__main__":
     try:
