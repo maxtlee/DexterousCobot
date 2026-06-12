@@ -11,6 +11,9 @@ frames, so each link of the chain
 can be checked in isolation:
   * ball still, arm moving: base must stay put. Drift that grows with arm
     rotation means camInTooltip is off (rerun calibrate_handeye.py).
+  * tooltip vs base directions: base = Rz(J0) @ tooltip. The two columns only
+    move alike near J0 = 0; at J0 = +90 deg (armA/armB) base motion is the
+    tooltip motion yawed 90 deg. The printed J0 makes this visible.
   * everything still: cam/tooltip/tool/base must all be steady; jitter here
     is detection/depth noise, before any transform is involved.
   * ball at a spot you can measure: base should match the tape measure, and
@@ -55,12 +58,18 @@ def fmt(p):
                            floatmode="fixed")
 
 def jointTargetStr(arm, kf):
-    """Joint target (deg) that would put the grasp point at the kf estimate."""
-    target = ballJointTarget(kf.position, getArmJoints(arm))
-    if target is None:
-        return "jt: unreachable"
-    return "jt" + np.array2string(np.degrees(target), precision=1,
-                                  suppress_small=True, floatmode="fixed") + " deg"
+    """Joint target (deg) for the kf estimate, prefixed with the current J0.
+
+    J0 is printed because base = Rz(J0) @ tooltip: at J0 = +90 deg (armA/armB
+    territory) the base and tooltip columns legitimately disagree by a 90 deg
+    yaw — that is the frame geometry, not a transform bug.
+    """
+    joints = getArmJoints(arm)
+    target = ballJointTarget(kf.position, joints)
+    jtPart = ("jt: unreachable" if target is None else
+              "jt" + np.array2string(np.degrees(target), precision=1,
+                                     suppress_small=True, floatmode="fixed") + " deg")
+    return f"J0 {np.degrees(joints[0]):+.1f}  {jtPart}"
 
 def main():
     print("all positions in meters; Ctrl+C to stop")
@@ -96,9 +105,13 @@ def main():
             pBase = toFrame(tooltipInBase, pTooltip)
             kf.update(pBase)
 
+            # rad = horizontal distance from the base column; pushing the ball
+            # straight toward the base must shrink it monotonically (the
+            # axis-convention-free check for the chain's yaw).
             print(f"cam{fmt(pCam)}  tooltip{fmt(pTooltip)}  tool{fmt(pTool)}  "
                   f"base{fmt(pBase)}  kf{fmt(kf.position)} "
-                  f"+-{kf.sigma.max():.3f}  {jointTargetStr(arm, kf)}")
+                  f"+-{kf.sigma.max():.3f}  rad {np.hypot(*kf.position[:2]):.3f}  "
+                  f"{jointTargetStr(arm, kf)}")
 
 if __name__ == "__main__":
     try:

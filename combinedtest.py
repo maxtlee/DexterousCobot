@@ -18,8 +18,9 @@ import pyrealsense2 as rs
 armA = (85*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
 armB = (95*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
 
-handOpen = [40, 40, 40, 40, 20, -60]
-handClosed = [70, 70, 70, 70, 50, -80]
+handOpen = [2.5, 2.5, 2.5, 2.5, 2.5, -35]
+handMiddle = [30, 30, 30, 30, 2.5, -99]
+handClosed = [45, 45, 45, 45, 22, -99]
 
 # ballColor as per-channel HSV [min H,S,V], [max H,S,V] (OpenCV scale:
 # H 0-179, S/V 0-255); a pixel is a ball pixel when min <= channel <= max
@@ -29,29 +30,44 @@ ballColor = ([9,110,20], [75,205,196])
 ballDiameter = 0.065  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
 
+# The hand-measured offsets below (grasp point and camera, measured in the
+# same session) turned out to be expressed in a tooltip frame whose X/Y axis
+# labels are yawed 90 deg from the frame the robot actually reports.
+# Diagnosed 2026-06-12: pushing the ball radially toward the base column made
+# the computed base position move tangentially (a pure vertical-axis yaw
+# error), while floor-plane and hand-projection tests had already pinned the
+# camera tilt and ruled out every other axis. tooltipFrameFix remaps every
+# hand-measured vector into the true frame. If a radial-motion test still
+# shows tangential drift (mirrored direction), the sign is wrong: use -90.
+tooltipFrameYaw = np.deg2rad(-90)
+tooltipFrameFix = np.array(
+    [[np.cos(tooltipFrameYaw), -np.sin(tooltipFrameYaw), 0],
+     [np.sin(tooltipFrameYaw),  np.cos(tooltipFrameYaw), 0],
+     [0, 0, 1]])
+
 # Custom tooltip offset: the physical tool point (grasp point) in the frame
 # that get_arm_position() reports tooltip_position in. The robot keeps
 # reporting/targeting its own tooltip frame; getToolPointInBase() /
 # toolPointTargetToTooltip() apply this offset in code. Because camInTooltip
 # stays relative to the *reported* tooltip, changing this offset does not
-# invalidate the hand-eye calibration.
+# invalidate the hand-eye calibration. Measured: Y+0.12 m, Z-0.10 m.
 tooltipOffset = np.eye(4)
-tooltipOffset[:3, 3] = [0.0, 0.12, -0.10]
+tooltipOffset[:3, 3] = tooltipFrameFix @ [-0.05, 0.12, -0.13]
 
 # Hand-eye extrinsics: pose of the RealSense *color* camera in the frame that
 # get_arm_position() reports tooltip_position in (4x4 homogeneous, meters).
 # Produced by calibrate_handeye.py, which writes camInTooltip.npy next to this
 # file. Until that exists, fall back to the hand-measured mounting offset:
-# Y-0.03 m, Z-0.07 m, roll -120 deg about the tooltip X axis; the camera is
-# mounted flipped 180 deg about its own optical (Z) axis.
+# Y-0.03 m, Z-0.07 m, roll -120 deg about the (measured) tooltip X axis; the
+# camera is mounted flipped 180 deg about its own optical (Z) axis.
 rollRad = np.deg2rad(-120)
 camInTooltipMeasured = np.eye(4)
-camInTooltipMeasured[:3, :3] = np.array(
+camInTooltipMeasured[:3, :3] = tooltipFrameFix @ np.array(
     [[1, 0, 0],
      [0, np.cos(rollRad), -np.sin(rollRad)],
      [0, np.sin(rollRad),  np.cos(rollRad)]]
 ) @ np.diag([-1.0, -1.0, 1.0])  # Rz(180): the 180-deg sensor flip
-camInTooltipMeasured[:3, 3] = [0.0, -0.03, -0.07]
+camInTooltipMeasured[:3, 3] = tooltipFrameFix @ [0.0, -0.03, -0.07]
 
 camInTooltipFile = Path(__file__).with_name("camInTooltip.npy")
 if camInTooltipFile.exists():
