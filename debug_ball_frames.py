@@ -16,11 +16,11 @@ can be checked in isolation:
   * ball at a spot you can measure: base should match the tape measure, and
     tool reads (0, 0, 0) exactly when the grasp point touches the ball center.
 
-The kf column is a constant-velocity Kalman estimate of the base-frame
-position (combinedtest.BallKalman) with its largest per-axis std and speed;
-on missed detections it coasts on the velocity model while the std grows.
-Compare kf against raw base to judge how much smoothing/lag the current
-tuning (sigmaAccel/sigmaMeas) gives.
+The kf column is a zero-velocity (random-walk) Kalman estimate of the
+base-frame position (combinedtest.BallKalman) with its largest per-axis std;
+on missed detections the estimate stays put while the std grows. Compare kf
+against raw base to judge how much smoothing/lag the current tuning
+(sigmaWalk/sigmaMeas) gives.
 
 SAFETY: read-only — never commands motion and never brakes/unbrakes the arm.
 Freedrive/jog the arm while it runs.
@@ -70,7 +70,7 @@ def main():
             if fit is None:
                 if kf.position is None:
                     print("ball: not found")
-                else:  # coast on the model; sigma grows until the next detection
+                else:  # zero-velocity model: estimate holds, sigma grows
                     print(f"ball: not found  kf base{fmt(kf.position)} "
                           f"+-{kf.sigma.max():.3f}")
                 continue
@@ -83,7 +83,7 @@ def main():
 
             print(f"cam{fmt(pCam)}  tooltip{fmt(pTooltip)}  tool{fmt(pTool)}  "
                   f"base{fmt(pBase)}  kf{fmt(kf.position)} "
-                  f"+-{kf.sigma.max():.3f}  v {np.linalg.norm(kf.velocity):.2f} m/s")
+                  f"+-{kf.sigma.max():.3f}")
 
 if __name__ == "__main__":
     try:

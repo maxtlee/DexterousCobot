@@ -218,73 +218,70 @@ def sampleBallDepth(depthM, center, radiusPx):
     return float(np.median(samples))
 
 class BallKalman:
-    """Constant-velocity Kalman filter for the ball center (meters).
+    """Zero-velocity (random-walk) Kalman filter for the ball center (meters).
 
-    Feed it base-frame measurements: ball motion is smooth in the world,
-    while camera-frame measurements jump whenever the arm moves, so filtering
-    in the base frame is what makes prediction across missed detections valid.
+    Feed it base-frame measurements: the ball sits still in the world while
+    camera-frame measurements jump whenever the arm moves, so the base frame
+    is the one where "the ball is not moving" is actually true.
 
-    State is [position, velocity]; the first update() initializes it (zero
-    velocity, wide velocity covariance). Call predict(dt) once per cycle with
-    the elapsed time, then update(z) when there is a detection; on a miss just
-    skip update and the estimate coasts on velocity while sigma grows.
+    The motion model assumes zero velocity: predict() leaves the position
+    estimate where it is and only inflates its covariance. During detection
+    dropouts the estimate therefore stays put instead of coasting away on a
+    velocity fitted to position jitter — with ~5 mm of jitter at ~15 Hz the
+    apparent velocity noise is ~0.1 m/s, swamping any real motion of a parked
+    ball. A ball that does move is still tracked (motion enters through the
+    measurement updates), just with lag, and it cannot be extrapolated
+    through an occlusion.
+
+    Call predict(dt) once per cycle with the elapsed time, then update(z)
+    when there is a detection; on a miss just skip update.
 
     Tuning: sigmaMeas is the per-axis std of one measurement (~2 mm observed
     at 0.3 m with stereo depth; raise it when the apparent-size fallback is
-    in play). sigmaAccel is the white-acceleration process noise — how hard
-    the ball might accelerate. Larger values trust new measurements more and
-    smooth less; ~1 m/s^2 suits a ball that is parked or carried by hand.
+    in play). sigmaWalk (m/sqrt(s)) says how far the "stationary" ball may
+    credibly drift per unit time; it sets the smoothing/lag trade-off. The
+    defaults give a steady-state gain of ~0.4 at 15 Hz: jitter is roughly
+    halved, and a ball carried at 0.1 m/s trails by ~1 cm. Lower sigmaWalk
+    for a parked ball (more smoothing), raise it to track hand motion.
     """
 
-    def __init__(self, sigmaAccel=1.0, sigmaMeas=0.005):
-        self.sigmaAccel = sigmaAccel
+    def __init__(self, sigmaWalk=0.01, sigmaMeas=0.005):
+        self.sigmaWalk = sigmaWalk
         self.sigmaMeas = sigmaMeas
-        self.x = None  # [px, py, pz, vx, vy, vz]
-        self.P = None
+        self.x = None  # [px, py, pz]
+        self.P = None  # 3x3 position covariance
 
     def predict(self, dt):
-        """Advance the estimate by dt seconds. No-op before the first update."""
+        """Advance the estimate by dt seconds: position is unchanged (zero-
+        velocity model), only the uncertainty grows. No-op before the first
+        update."""
         if self.x is None:
             return
-        F = np.eye(6)
-        F[:3, 3:] = dt * np.eye(3)
-        I3 = np.eye(3)
-        Q = self.sigmaAccel ** 2 * np.block([
-            [dt ** 4 / 4 * I3, dt ** 3 / 2 * I3],
-            [dt ** 3 / 2 * I3, dt ** 2 * I3],
-        ])
-        self.x = F @ self.x
-        self.P = F @ self.P @ F.T + Q
+        self.P = self.P + self.sigmaWalk ** 2 * dt * np.eye(3)
 
     def update(self, z):
         """Fold in a measured base-frame ball position (3-vector, meters)."""
         z = np.asarray(z, dtype=float)
         if self.x is None:
-            self.x = np.concatenate([z, np.zeros(3)])
-            # Position known to measurement accuracy; velocity unknown (std 1 m/s).
-            self.P = np.diag([self.sigmaMeas ** 2] * 3 + [1.0] * 3)
+            self.x = z.copy()
+            self.P = self.sigmaMeas ** 2 * np.eye(3)
             return
-        # H selects position, so H P H^T = P[:3,:3] and P H^T = P[:,:3].
-        S = self.P[:3, :3] + self.sigmaMeas ** 2 * np.eye(3)
-        K = self.P[:, :3] @ np.linalg.inv(S)
-        self.x = self.x + K @ (z - self.x[:3])
-        self.P = self.P - K @ self.P[:3, :]
+        # H = I: the full state is measured directly.
+        S = self.P + self.sigmaMeas ** 2 * np.eye(3)
+        K = self.P @ np.linalg.inv(S)
+        self.x = self.x + K @ (z - self.x)
+        self.P = self.P - K @ self.P
         self.P = (self.P + self.P.T) / 2  # keep symmetric against roundoff
 
     @property
     def position(self):
         """Estimated ball center (3-vector, m), or None before the first update."""
-        return None if self.x is None else self.x[:3].copy()
-
-    @property
-    def velocity(self):
-        """Estimated ball velocity (3-vector, m/s), or None before the first update."""
-        return None if self.x is None else self.x[3:].copy()
+        return None if self.x is None else self.x.copy()
 
     @property
     def sigma(self):
         """Per-axis position std (3-vector, m), or None before the first update."""
-        return None if self.P is None else np.sqrt(np.diag(self.P)[:3])
+        return None if self.P is None else np.sqrt(np.diag(self.P))
 
 def getTooltipInBase(arm):
     """Current tooltip pose as a 4x4 base-frame transform (meters)."""
