@@ -616,12 +616,25 @@ def initArm(arm):
     arm.recovery.recover.recover().ok()
 
 def moveHand(hand, position):
+    """Set the hand target; the client's write thread streams it to the hand.
+
+    A single send is not enough: the Ability Hand drops out of API mode (and
+    snaps back to its firmware-default grip) the moment commands stop
+    arriving. The AHSerialClient write thread re-sends the current target at
+    rate_hz, which is what actually holds a position — including the closed
+    grip while the arm carries the ball home. set_position only swaps the
+    streamed command (thread-safe), so this returns immediately.
+    """
     hand.set_position(positions=position, reply_mode=2)
-    hand.send_command()
 
 class HandClient:
     def __enter__(self):
-        self.hand = AHSerialClient(write_thread=False)
+        # The constructor pre-loads a half-closed default target
+        # (set_position(30)), so load handOpen before the write thread
+        # starts streaming — connecting must not move the hand.
+        self.hand = AHSerialClient(auto_start_threads=False)
+        self.hand.set_position(positions=handOpen, reply_mode=2)
+        self.hand.start_threads()
         return self.hand
 
     def __exit__(self,a,b,c):
