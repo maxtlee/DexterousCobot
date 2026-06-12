@@ -118,10 +118,10 @@ cameraSettings = {
 # --- pickup-routine tuning
 waitingStableS = 0.5          # ball must be valid + stationary this long
 stationaryTolM = 0.02         # max kf wander allowed within that window
-reachedTolRad = np.deg2rad(1.0)   # per-joint |current - target| = "arrived"
-retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
-handActuateS = 1.5            # settle time after each hand command
-routineSpeedScale = 0.3       # conservative speed for autonomous motion
+reachedTolRad = np.deg2rad(2.0)   # per-joint |current - target| = "arrived"
+retargetTolRad = np.deg2rad(2.0)  # re-send when the target moves this much
+handActuateS = 0.4            # settle time after each hand command
+routineSpeedScale = 1.0       # conservative speed for autonomous motion
 homeTimeoutS = 20.0
 
 def main():
