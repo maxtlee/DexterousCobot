@@ -120,15 +120,17 @@ waitingStableS = 0.5          # ball must be valid + stationary this long
 stationaryTolM = 0.02         # max kf wander allowed within that window
 reachedTolRad = np.deg2rad(1.0)   # per-joint |current - target| = "arrived"
 retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
+approachStepFraction = 0.8    # each approach leg covers this share of the gap
 handActuateS = 1.5            # settle time after each hand command
 routineSpeedScale = 0.3       # conservative speed for autonomous motion
 homeTimeoutS = 20.0
 
 def main():
-    """Infinite pickup cycle: wait for a valid, stationary ball -> move to it
-    with continuous Kalman-based retargeting -> grasp -> deliver home -> drop
-    -> wait again. Aborts home whenever the ball estimate leaves the taught
-    valid region (or becomes unreachable)."""
+    """Infinite pickup cycle: wait for a valid, stationary ball -> approach it
+    in legs that each cover approachStepFraction of the remaining way, with
+    the target continuously recalculated from the Kalman estimate -> grasp ->
+    deliver home -> drop -> wait again. Aborts home whenever the ball estimate
+    leaves the taught valid region (or becomes unreachable)."""
     if ballRegionMin is None:
         print("WARNING: no ballRegion.json — every reachable position counts "
               "as valid. Teach the region with collect_ball_region.py.")
@@ -139,7 +141,7 @@ def main():
         goHome(arm)
         kf = BallKalman()
         history = deque()       # (t, kf position) while continuously valid
-        lastSent = None
+        lastLeg = None          # (commanded step, target it was based on)
         state = "waiting"
         lastT = monotonic()
         print("waiting for a ball...")
@@ -160,7 +162,7 @@ def main():
                     if (lastT - history[0][0] >= waitingStableS
                             and np.linalg.norm(pts.max(0) - pts.min(0)) < stationaryTolM):
                         print(f"ball stable at {np.round(pos, 3)} -> moving")
-                        state, lastSent = "moving", None
+                        state, lastLeg = "moving", None
                 else:
                     history.clear()
 
@@ -168,18 +170,26 @@ def main():
                 if target is None:
                     print("ball left the valid region -> returning home")
                     goHome(arm)
-                    kf, lastSent, state = BallKalman(), None, "waiting"
+                    kf, lastLeg, state = BallKalman(), None, "waiting"
                     history.clear()
                     print("waiting for a ball...")
                 elif armReached(joints, target):
                     graspAndDeliver(arm, hand)
-                    kf, lastSent, state = BallKalman(), None, "waiting"
+                    kf, lastLeg, state = BallKalman(), None, "waiting"
                     history.clear()
                     print("waiting for a ball...")
-                elif (lastSent is None
-                        or np.max(np.abs(target - lastSent)) > retargetTolRad):
-                    if moveArm(arm, target, speedScale=routineSpeedScale):
-                        lastSent = target
+                # Send the next leg when the previous one finished or the
+                # target moved. Each leg only covers approachStepFraction of
+                # the current-to-target gap: early legs are long while the
+                # estimate is coarse, the final legs creep in as close-range
+                # vision sharpens it — a stale initial estimate can no longer
+                # ram the fingers into the ball at full stride.
+                elif (lastLeg is None
+                        or np.max(np.abs(target - lastLeg[1])) > retargetTolRad
+                        or armReached(joints, lastLeg[0])):
+                    step = joints + approachStepFraction * (target - joints)
+                    if moveArm(arm, step, speedScale=routineSpeedScale):
+                        lastLeg = (step, target)
 
 def perceiveBall(arm, cam, kf, lastT):
     """One vision tick: predict the kf and fold in a detection when there is
