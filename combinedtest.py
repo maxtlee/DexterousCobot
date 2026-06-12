@@ -1,10 +1,11 @@
+import json
 import numpy as np
 import cv2
 from pathlib import Path
 from standardbots import StandardBotsRobot, models
 from collections import deque
 import base64
-from time import sleep
+from time import sleep, monotonic
 
 import matplotlib as mpl
 import matplotlib.pyplot as plt
@@ -15,8 +16,7 @@ from ah_wrapper import AHSerialClient
 
 import pyrealsense2 as rs
 
-armA = (85*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
-armB = (95*3.14/180, 16*3.14/180, 144*3.14/180, 22*3.14/180, -270*3.14/180, 180*3.14/180)
+armHome = (-60*3.14/180, -25*3.14/180, 113*3.14/180, 126*3.14/180, -323*3.14/180, 147*3.14/180)
 
 handOpen = [2.5, 2.5, 2.5, 2.5, 2.5, -35]
 handMiddle = [30, 30, 30, 30, 2.5, -99]
@@ -77,6 +77,23 @@ else:
           "(run calibrate_handeye.py for a calibrated one)")
     camInTooltip = camInTooltipMeasured
 
+# Valid pickup region (axis-aligned box, base frame), taught by sweeping the
+# ball through valid/invalid positions with collect_ball_region.py. Without
+# it every reachable position counts as valid (the routine warns at startup).
+ballRegionFile = Path(__file__).with_name("ballRegion.json")
+if ballRegionFile.exists():
+    _region = json.loads(ballRegionFile.read_text())
+    ballRegionMin = np.array(_region["min"])
+    ballRegionMax = np.array(_region["max"])
+else:
+    ballRegionMin = ballRegionMax = None
+
+def isValidBallPosition(p):
+    """True when p (base-frame xyz, m) is inside the taught valid region."""
+    if ballRegionMin is None:
+        return True
+    return bool(np.all(p >= ballRegionMin) and np.all(p <= ballRegionMax))
+
 metersPerUnit = {
     models.LinearUnitKind.Millimeters: 0.001,
     models.LinearUnitKind.Centimeters: 0.01,
@@ -98,21 +115,130 @@ cameraSettings = {
     "auto_white_balance": True,
 }
 
+# --- pickup-routine tuning
+waitingStableS = 0.5          # ball must be valid + stationary this long
+stationaryTolM = 0.02         # max kf wander allowed within that window
+reachedTolRad = np.deg2rad(3.0)   # per-joint |current - target| = "arrived"
+retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
+armStillTolM = 0.003          # skip kf updates when the tooltip moved more
+armStillTolRad = np.deg2rad(0.5)  # ... or rotated more during the frame grab
+handActuateS = 1.5            # settle time after each hand command
+routineSpeedScale = 0.3       # conservative speed for autonomous motion
+homeTimeoutS = 20.0
+
 def main():
-    with ArmClient() as arm, CamClient() as cam:
-        # initArm(arm)
-        # moveHand(hand, handOpen)
+    """Infinite pickup cycle: wait for a valid, stationary ball -> move to it
+    with continuous Kalman-based retargeting -> grasp -> deliver home -> drop
+    -> wait again. Aborts home whenever the ball estimate leaves the taught
+    valid region (or becomes unreachable)."""
+    if ballRegionMin is None:
+        print("WARNING: no ballRegion.json — every reachable position counts "
+              "as valid. Teach the region with collect_ball_region.py.")
 
-        pose = getTennisBallPose(arm, cam, debug=True)
-        if pose is None:
-            print("tennis ball: not found")
-        else:
-            position, orientation = pose
-            print("tennis ball position (m, robot base frame):",
-                  np.array2string(position, precision=4, suppress_small=True))
-            print("tennis ball orientation (quaternion xyzw, placeholder):", orientation)
+    with ArmClient() as arm, CamClient() as cam, HandClient() as hand:
+        initArm(arm)
+        moveHand(hand, handOpen)
+        goHome(arm)
+        kf = BallKalman()
+        history = deque()       # (t, kf position) while continuously valid
+        lastSent = None
+        state = "waiting"
+        lastT = monotonic()
+        print("waiting for a ball...")
 
-        # moveHand(hand, handClosed)
+        while True:
+            lastT, detected, joints = perceiveBall(arm, cam, kf, lastT)
+            pos = kf.position
+            target = None
+            if pos is not None and isValidBallPosition(pos):
+                target = ballJointTarget(pos, joints)
+
+            if state == "waiting":
+                if detected and target is not None:
+                    history.append((lastT, pos.copy()))
+                    while history and lastT - history[0][0] > waitingStableS + 0.2:
+                        history.popleft()
+                    pts = np.array([p for _, p in history])
+                    if (lastT - history[0][0] >= waitingStableS
+                            and np.linalg.norm(pts.max(0) - pts.min(0)) < stationaryTolM):
+                        print(f"ball stable at {np.round(pos, 3)} -> moving")
+                        state, lastSent = "moving", None
+                else:
+                    history.clear()
+
+            elif state == "moving":
+                if target is None:
+                    print("ball left the valid region -> returning home")
+                    goHome(arm)
+                    kf, lastSent, state = BallKalman(), None, "waiting"
+                    history.clear()
+                    print("waiting for a ball...")
+                elif armReached(joints, target):
+                    graspAndDeliver(arm, hand)
+                    kf, lastSent, state = BallKalman(), None, "waiting"
+                    history.clear()
+                    print("waiting for a ball...")
+                elif (lastSent is None
+                        or np.max(np.abs(target - lastSent)) > retargetTolRad):
+                    if moveArm(arm, target, speedScale=routineSpeedScale):
+                        lastSent = target
+
+def perceiveBall(arm, cam, kf, lastT):
+    """One vision tick: predict the kf, update it with a detection when the
+    arm held still across the frame grab (no hardware sync, so measurements
+    taken mid-motion are stale by a frame and would corrupt the estimate;
+    skipping them lets the zero-velocity kf coast — which also covers the
+    hand occluding the ball during the final approach).
+
+    Returns (timestamp, updated: bool, current joints)."""
+    T1, _ = getArmState(arm)
+    for _ in range(2):  # flush so the frame is current
+        frame, depthM, intr = getFrames(cam)
+    T2, joints = getArmState(arm)
+
+    now = monotonic()
+    kf.predict(now - lastT)
+
+    armMoved = (np.linalg.norm(T1[:3, 3] - T2[:3, 3]) > armStillTolM
+                or np.arccos(np.clip((np.trace(T1[:3, :3].T @ T2[:3, :3]) - 1) / 2,
+                                     -1, 1)) > armStillTolRad)
+    fit = None if armMoved else fitCircleInArray(maskBall(frame))
+    if fit is None:
+        return now, False, joints
+
+    pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
+    kf.update((T2 @ camInTooltip @ np.append(pCam, 1.0))[:3])
+    return now, True, joints
+
+def armReached(current, target, tol=reachedTolRad):
+    """True when every joint is within tol of the target (2*pi-wrapped)."""
+    d = np.abs(np.asarray(current) - np.asarray(target)) % (2 * np.pi)
+    return bool(np.max(np.minimum(d, 2 * np.pi - d)) < tol)
+
+def goHome(arm):
+    moveArm(arm, armHome, speedScale=routineSpeedScale)
+    waitUntilReached(arm, armHome)
+
+def waitUntilReached(arm, target, timeoutS=homeTimeoutS):
+    t0 = monotonic()
+    while monotonic() - t0 < timeoutS:
+        if armReached(getArmJoints(arm), target):
+            return True
+        sleep(0.1)
+    print(f"warning: arm did not reach the target within {timeoutS:.0f} s")
+    return False
+
+def graspAndDeliver(arm, hand):
+    print("at the ball -> grasping")
+    moveHand(hand, handMiddle)
+    sleep(handActuateS)
+    moveHand(hand, handClosed)
+    sleep(handActuateS)
+    print("delivering home")
+    goHome(arm)
+    moveHand(hand, handOpen)
+    sleep(handActuateS)
+    print("dropped — reset the ball to run another cycle")
 
 def getTennisBallPose(arm, cam, debug=False):
     """Absolute 6-DoF pose of the tennis ball in the robot base frame.
@@ -299,8 +425,9 @@ class BallKalman:
         """Per-axis position std (3-vector, m), or None before the first update."""
         return None if self.P is None else np.sqrt(np.diag(self.P))
 
-def getTooltipInBase(arm):
-    """Current tooltip pose as a 4x4 base-frame transform (meters)."""
+def getArmState(arm):
+    """(tooltip pose as 4x4 base-frame transform, joints as 6-vector of
+    radians) from a single get_arm_position call."""
     combined = arm.movement.position.get_arm_position().ok()
     tooltip = combined.tooltip_position
     if (tooltip is None or tooltip.position is None
@@ -312,7 +439,11 @@ def getTooltipInBase(arm):
     T = np.eye(4)
     T[:3, :3] = quatToMat(q.x, q.y, q.z, q.w)
     T[:3, 3] = np.array([tooltip.position.x, tooltip.position.y, tooltip.position.z]) * scale
-    return T
+    return T, np.array(combined.joint_rotations, dtype=float)
+
+def getTooltipInBase(arm):
+    """Current tooltip pose as a 4x4 base-frame transform (meters)."""
+    return getArmState(arm)[0]
 
 def getToolPointInBase(arm):
     """Current physical tool point (tooltipOffset applied) as a 4x4 base-frame
@@ -407,8 +538,7 @@ def ballJointTarget(ball, currentJoints,
 
 def getArmJoints(arm):
     """Current joint rotations J0..J5 (radians) as a 6-vector."""
-    combined = arm.movement.position.get_arm_position().ok()
-    return np.array(combined.joint_rotations, dtype=float)
+    return getArmState(arm)[1]
 
 def quatToMat(x, y, z, w):
     n = np.sqrt(x*x + y*y + z*z + w*w)
@@ -439,16 +569,30 @@ def getCameraFrame(cam):
     """RGB frame only (kept for tune_ball_color.py)."""
     return getFrames(cam)[0]
 
-def moveArm(arm, position):
+def moveArm(arm, position, speedScale=None):
+    """Send a joint-space target. Returns True when the robot accepted it.
+
+    speedScale (0..1) scales the default speed profile; the pickup routine
+    uses a conservative value. Rejections (e.g. while a previous motion is
+    still executing, depending on firmware semantics) are printed and
+    reported as False — callers retry on the next loop tick.
+    """
+    profile = None
+    if speedScale is not None:
+        profile = models.SpeedProfile(scaling_factor=float(speedScale))
     body = models.ArmPositionUpdateRequest(
         kind=models.ArmPositionUpdateRequestKindEnum.JointRotation,
-        joint_rotation=models.ArmJointRotations(joints=position),
+        joint_rotation=models.ArmJointRotations(
+            joints=tuple(float(j) for j in position)),
+        speed_profile=profile,
     )
     response = arm.movement.position.set_arm_position(body)
     try:
-        print(response.ok())
+        response.ok()
+        return True
     except Exception:
-        print(response.data.message)
+        print("moveArm rejected:", getattr(response.data, "message", response.data))
+        return False
 
 def initArm(arm):
     arm.movement.brakes.unbrake().ok()

@@ -39,6 +39,8 @@ Usage:
 """
 
 import time
+from time import sleep
+import cv2
 
 import numpy as np
 
@@ -84,6 +86,7 @@ def main():
             # otherwise serve ever-staler images.
             for _ in range(2):
                 frame, depthM, intr = getFrames(cam)
+            cv2.imwrite("frame.jpeg", frame)
             tooltipInBase = getTooltipInBase(arm)
 
             now = time.monotonic()
@@ -112,6 +115,7 @@ def main():
                   f"base{fmt(pBase)}  kf{fmt(kf.position)} "
                   f"+-{kf.sigma.max():.3f}  rad {np.hypot(*kf.position[:2]):.3f}  "
                   f"{jointTargetStr(arm, kf)}")
+            sleep(0.5)
 
 if __name__ == "__main__":
     try:
