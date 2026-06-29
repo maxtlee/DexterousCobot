@@ -4,3 +4,4 @@ numpy
 ability-hand
 pyserial>=3.5
 matplotlib>=3.6.3,<=3.10.0
+pyrealsense2
