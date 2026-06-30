@@ -17,6 +17,7 @@ from ah_wrapper import AHSerialClient
 import pyrealsense2 as rs
 
 armHome = (-60*3.14/180, -25*3.14/180, 113*3.14/180, 126*3.14/180, -323*3.14/180, 147*3.14/180)
+# armHome = (-96.2*3.14/180, -1.8*3.14/180, 135.4*3.14/180, 160.4*3.14/180, -352.0*3.14/180, 60.7*3.14/180)
 
 handOpen = [2.5, 2.5, 2.5, 2.5, 2.5, -35]
 handMiddle = [30, 30, 30, 30, 2.5, -99]
@@ -27,7 +28,7 @@ handClosed = [45, 45, 45, 45, 22, -99]
 # for all 3 HSV channels.
 ballColor = ([9,110,20], [75,205,196])
 
-ballDiameter = 0.065  # m (standard tennis ball)
+ballDiameter = 0.066  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
 
 # The hand-measured offsets below (grasp point and camera, measured in the
@@ -112,7 +113,7 @@ cameraSettings = {
     "sharpness": 50,
     "hue": 0,
     "white_balance": 4600,
-    "auto_white_balance": True,
+    "auto_white_balance": False,
 }
 
 # --- pickup-routine tuning
@@ -145,13 +146,15 @@ def main():
         print("waiting for a ball...")
 
         while True:
-            lastT, detected, joints = perceiveBall(arm, cam, kf, lastT)
+            lastT, detected, joints = perceiveBall(
+                arm, cam, kf, lastT, debug=state == "waiting")
             pos = kf.position
             target = None
             if pos is not None and isValidBallPosition(pos):
                 target = ballJointTarget(pos, joints)
 
             if state == "waiting":
+                print(kf.position)
                 if detected and target is not None:
                     history.append((lastT, pos.copy()))
                     while history and lastT - history[0][0] > waitingStableS + 0.2:
@@ -181,7 +184,7 @@ def main():
                     if moveArm(arm, target, speedScale=routineSpeedScale):
                         lastSent = target
 
-def perceiveBall(arm, cam, kf, lastT):
+def perceiveBall(arm, cam, kf, lastT, debug=False):
     """One vision tick: predict the kf and fold in a detection when there is
     one. Measurements are accepted while the arm moves: there is no hardware
     sync between frame and pose, so a mid-motion measurement is stale by up
@@ -191,6 +194,9 @@ def perceiveBall(arm, cam, kf, lastT):
     clipped by the frame edge are rejected in fitCircleInArray; on any miss
     (occlusion by the hand included) the zero-velocity kf just coasts.
 
+    When debug is set (the routine passes it while waiting) the current frame
+    and the labelled mask are dumped to disk for a remote viewer.
+
     Returns (timestamp, updated: bool, current joints)."""
     for _ in range(2):  # flush so the frame is current
         frame, depthM, intr = getFrames(cam)
@@ -199,13 +205,35 @@ def perceiveBall(arm, cam, kf, lastT):
     now = monotonic()
     kf.predict(now - lastT)
 
-    fit = fitCircleInArray(maskBall(frame))
+    mask = maskBall(frame)
+    fit = fitCircleInArray(mask)
+    if debug:
+        writeDebugFrames(frame, mask, fit)
     if fit is None:
         return now, False, joints
 
     pCam = ballCenterInCam(fit[0], fit[1], depthM, intr)
     kf.update((T @ camInTooltip @ np.append(pCam, 1.0))[:3])
     return now, True, joints
+
+debugFrameFile = Path(__file__).with_name("frame.jpeg")
+debugFilteredFile = Path(__file__).with_name("filtered.jpeg")
+
+def writeDebugFrames(frame, mask, fit):
+    """Dump the current camera view (frame.jpeg) and the ball mask with the
+    fitted circle drawn on it (filtered.jpeg) next to this file.
+
+    frame is RGB (RealSense order) so it is flipped to BGR for cv2.imwrite;
+    mask is the binary HSV mask, shown in grey with the detection circled in
+    red (centre dot in green) when fitCircleInArray accepted a ball."""
+    cv2.imwrite(str(debugFrameFile), cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
+    labeled = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    if fit is not None:
+        (x, y), diameter = fit
+        center = (int(round(x)), int(round(y)))
+        cv2.circle(labeled, center, int(round(diameter / 2)), (0, 0, 255), 2)
+        cv2.circle(labeled, center, 2, (0, 255, 0), -1)
+    cv2.imwrite(str(debugFilteredFile), labeled)
 
 def armReached(current, target, tol=reachedTolRad):
     """True when every joint is within tol of the target (2*pi-wrapped)."""
