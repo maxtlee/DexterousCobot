@@ -28,7 +28,7 @@ handClosed = [45, 45, 45, 45, 22, -99]
 # for all 3 HSV channels.
 ballColor = ([9,110,20], [75,205,196])
 
-ballDiameter = 0.066  # m (standard tennis ball)
+ballDiameter = 0.0675  # m (standard tennis ball)
 ballRadius = ballDiameter / 2
 
 # The hand-measured offsets below (grasp point and camera, measured in the
@@ -119,8 +119,8 @@ cameraSettings = {
 # --- pickup-routine tuning
 waitingStableS = 0.5          # ball must be valid + stationary this long
 stationaryTolM = 0.02         # max kf wander allowed within that window
-reachedTolRad = np.deg2rad(1.0)   # per-joint |current - target| = "arrived"
-retargetTolRad = np.deg2rad(1.0)  # re-send when the target moves this much
+reachedTolRad = np.deg2rad(2.0)   # per-joint |current - target| = "arrived"
+retargetTolRad = np.deg2rad(2.0)  # re-send when the target moves this much
 handActuateS = 0.4            # settle time after each hand command
 routineSpeedScale = 1.0       # conservative speed for autonomous motion
 homeTimeoutS = 20.0
