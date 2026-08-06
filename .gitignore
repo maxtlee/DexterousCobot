@@ -2,3 +2,8 @@
 !.gitignore
 *.log
 __pycache__
+
+# Raw demo footage (141 MB, over GitHub's file limit). The compressed
+# derivatives that the README uses live in media/.
+Demo Video.mp4
+handeye_captures/
